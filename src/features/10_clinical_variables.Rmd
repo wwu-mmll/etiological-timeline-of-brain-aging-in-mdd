@@ -1,0 +1,76 @@
+```{r setup, include = TRUE}
+library(tidyverse)
+library(here)
+library(janitor)
+library(glue)
+library(fs)
+library(haven)
+
+knitr::opts_chunk$set(echo = TRUE)
+conf <- config::get()
+```
+
+```{r}
+assessments_with_scans <- read_csv(here("data/raw", "mris_for_converter_analysis.csv"))
+clinical_data <- read_csv(here("data/raw", "subjects_study_data.csv"))
+brainage_data <- read_csv(here("data/processed", "brainage_for_converter_analysis.csv"))
+
+subjects_with_mri_and_clinical <- assessments_with_scans %>%
+    left_join(clinical_data, by = c("cohort", "subject_id", "assessment")) %>%
+    left_join(brainage_data %>% select(-date_mri, -group, -scanner), by = c("cohort", "subject_id", "assessment"))
+```
+
+missing ages
+```{r}
+print(glue("Now {subjects_with_mri_and_clinical %>% filter(is.na(age)) %>% nrow()} subjects are missing age"))
+```
+clean missing onset DateOfOnset
+```{r}
+print(glue("We have {subjects_with_mri_and_clinical %>% filter(is.na(onset_date)) %>% nrow()} subjects with missing onset_date. Infering from other subject entries."))
+# subjects_with_mri_and_clinical <- 
+subjects_with_mri_and_clinical <- subjects_with_mri_and_clinical %>%
+    group_by(subject_id) %>%
+    mutate(
+        onset_date = first(onset_date[!is.na(onset_date)])
+    ) %>%
+    ungroup()
+print(glue("Now {subjects_with_mri_and_clinical %>% filter(is.na(onset_date)) %>% nrow()} subjects are missing onset_date"))
+```
+clean missing sex
+```{r}
+print(glue("We have {subjects_with_mri_and_clinical %>% filter(is.na(sex)) %>% nrow()} subjects with missing sex. Infering from other subject entries."))
+# subjects_with_mri_and_clinical <- 
+subjects_with_mri_and_clinical <- subjects_with_mri_and_clinical %>%
+    group_by(subject_id) %>%
+    mutate(
+        sex = first(sex[!is.na(sex)])
+    ) %>%
+    ungroup()
+print(glue("Now {subjects_with_mri_and_clinical %>% filter(is.na(sex)) %>% nrow()} subjects are missing sex"))
+```
+
+```{r}
+subjects_with_mri_and_clinical_sorted <- subjects_with_mri_and_clinical %>%
+    arrange(cohort, subject_id, assessment) %>%
+    rename(
+        chronological_age = age,
+        brain_age = brain.predicted_age,
+        brain_age_lower = lower.CI,
+        brain_age_upper = upper.CI
+    ) %>%
+    mutate(
+        scanner = as.factor(scanner),
+        tiv = gmv + wmv + csf,
+        BAG = brain_age - chronological_age,
+        group = factor(group, levels = c("HC", "MDD", "CON"), labels = c("HC", "MDD", "CON")),
+        remission = factor(remission, levels = c(0, 1, 2), labels = c("Non-remitted", "Remitted", "Healthy")),
+        recurrence = factor(recurrence, levels = c(0, 1, 2), labels = c("Non-recurring", "Recurring", "Healthy"))
+    )
+
+write.table(subjects_with_mri_and_clinical_sorted,
+            file = here("data/processed/converter_dataset.csv"),
+            sep = ",", quote = FALSE,
+            row.names = FALSE
+)
+```
+

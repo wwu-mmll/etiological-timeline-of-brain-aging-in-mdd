@@ -1,0 +1,3 @@
+"cohort","group","subject_id","assessment","date_mri","scanner","image_path","file_name"
+"abc","HC","123",0,"2020-01-01","scanner_1","/path/to/mri.nii","mri.nii"
+"def","MDD","456",6,"2022-01-01","scanner_1","/path/to/mri.nii","mri.nii"

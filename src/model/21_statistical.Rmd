@@ -1,0 +1,1362 @@
+
+```{r setup, include = TRUE}
+library(tidyverse)
+library(here)
+library(glue)
+library(lmerTest)
+library(emmeans)
+library(car)
+library(ggplot2)
+library(ggeffects)
+library(ggsignif)
+library(patchwork)
+library(effectsize)
+library(TOSTER)
+library(broom.mixed)
+
+knitr::opts_chunk$set(echo = TRUE)
+conf <- config::get()
+```
+
+```{r load-data}
+brainager_predictions <- read.csv(here("data/processed/converter_dataset_matched_corrected.csv"))
+unmatched_dataset <- read.csv(here("data/processed/converter_dataset_trimmed_con.csv"))
+
+full_dataset <- brainager_predictions %>%
+    filter(!is.na(brain_age), !is.na(assessment_exact)) %>%
+    mutate(
+        cohort = as.factor(cohort),
+        scanner = as.factor(scanner),
+        site = as.factor(site),
+        tiv = gmv + wmv + csf,
+        duration_episodes_depr = ifelse(is.na(duration_episodes_depr), 0, duration_episodes_depr),
+        group = factor(group, levels = c("HC", "MDD", "CON"), labels = c("HC", "MDD", "CON")),
+        remission = factor(remission, levels = c("Non-remitted", "Remitted", "Healthy"), labels = c("Non-remitted", "Remitted", "Healthy")),
+        recurrence = factor(recurrence, levels = c("Non-recurring", "Recurring", "Healthy"), labels = c("Non-recurring", "Recurring", "Healthy")),
+    ) %>%
+    select(
+        subject_id, group, cohort, assessment, assessment_exact,
+        BAG, BAG_corrected, brain_age,
+        sex, chronological_age, tiv, scanner,
+        cesd, bdi, HAMD17, onset_age, remission, recurrence, duration_episodes_depr, number_episodes_depr, medindex, BMI
+    )
+
+mnc_macs_longitudinal <- full_dataset %>% filter(cohort %in% c("mnc", "macs"))
+mnc_macs_baseline <- mnc_macs_longitudinal %>% filter(assessment_exact == 0)
+mnc_macs_followup <- mnc_macs_longitudinal %>% filter(assessment_exact > 0)
+
+bidirect_longitudinal <- full_dataset %>% filter(cohort == "bidirect")
+bidirect_baseline <- bidirect_longitudinal %>% filter(assessment_exact == 0)
+bidirect_followup <- bidirect_longitudinal %>% filter(assessment_exact > 0)
+
+mm_clinical_followup <- mnc_macs_followup %>% filter(group %in% c("CON", "MDD"))
+bd_clinical_followup <- bidirect_followup %>% filter(group %in% c("CON", "MDD"))
+mm_clinical_longitudinal <- mnc_macs_longitudinal %>% filter((group == "CON" & assessment_exact > 0) | group == "MDD")
+bd_clinical_longitudinal <- bidirect_longitudinal %>% filter((group == "CON" & assessment_exact > 0) | group == "MDD")
+
+mnc_macs_lmer_model <- lmer(
+    BAG ~ group * assessment_exact + poly(chronological_age, 2) + sex + scale(tiv) + (1 | subject_id) + (1 | scanner),
+    data = mnc_macs_longitudinal,
+)
+bidirect_lmer_model <- lmer(
+    BAG ~ group * assessment_exact + poly(chronological_age, 2) + sex + scale(tiv) + (1 | subject_id),
+    data = bidirect_longitudinal,
+)
+```
+
+# Dataset characteristics
+```{r}
+mnc_macs_baseline %>% group_by(group) %>%
+    summarise(
+        n = n(),
+        mean_age = mean(chronological_age, na.rm = TRUE),
+        sd_age = sd(chronological_age, na.rm = TRUE),
+        mean_bag = mean(BAG_corrected, na.rm = TRUE),
+        sd_bag = sd(BAG_corrected, na.rm = TRUE)
+    )
+bidirect_baseline %>% group_by(group) %>%
+    summarise(
+        n = n(),
+        mean_age = mean(chronological_age, na.rm = TRUE),
+        sd_age = sd(chronological_age, na.rm = TRUE),
+        mean_bag = mean(BAG_corrected, na.rm = TRUE),
+        sd_bag = sd(BAG_corrected, na.rm = TRUE)
+    )
+# summary(bidirect_longitudinal)
+```
+
+# baseline differences
+## clincal characteristics
+```{r}
+message("HAMD")
+mm_hamd_model <- lm(
+    HAMD17 ~ group + sex + poly(chronological_age, 2),
+    data = mnc_macs_baseline
+)
+mm_hamd_anova <- Anova(mm_hamd_model, type = "III")
+print(mm_hamd_anova)
+eta_squared(mm_hamd_anova, partial = TRUE)
+mm_hamd_emm <- emmeans(mm_hamd_model, pairwise ~ group, adjust = "tukey")
+print(mm_hamd_emm)
+confint(mm_hamd_emm$contrasts)
+eff_size(emmeans(mm_hamd_model, ~ group), sigma = sigma(mm_hamd_model), edf = df.residual(mm_hamd_model))
+
+clincically_relevant_hamd_delta <- 7 # suggested by Moncrieff & Kirsch 2015
+hamd_con_hc_tost <- tsum_TOST(
+    m1           = 1.01,                  # Absolute estimate of the HC-CON difference
+    sd1          = 0.875 * sqrt(511 + 1), # se + sqrt(df)
+    n1           = 511 + 1,               # df +1
+    low_eqbound  = -clincically_relevant_hamd_delta,           
+    high_eqbound = clincically_relevant_hamd_delta,            
+    hypothesis   = "EQU"
+)
+print(hamd_con_hc_tost)
+```
+
+```{r}
+message("BDI")
+mm_bdi_model <- lm(
+    bdi ~ group + sex + poly(chronological_age, 2),
+    data = mnc_macs_baseline
+)
+mm_bdi_anova <- Anova(mm_bdi_model, type = "III")
+print(mm_bdi_anova)
+eta_squared(mm_bdi_anova, partial = TRUE)
+mm_bdi_emm <- emmeans(mm_bdi_model, pairwise ~ group, adjust = "tukey") # HC - CON in paper
+print(mm_bdi_emm)
+confint(mm_bdi_emm$contrasts)
+eff_size(emmeans(mm_bdi_model, ~ group), sigma = sigma(mm_bdi_model), edf = df.residual(mm_bdi_model))
+
+clincically_relevant_bdi_delta <- 22.12 * 0.175   # emmean MDD * percentage for clinically relevant difference (Button, 2015)
+
+bdi_con_hc_tost <- tsum_TOST(
+    m1           = 3.17,                 # Absolute estimate of the HC-CON difference
+    sd1          = 1.36 * sqrt(496 + 1), # se + sqrt(df)
+    n1           = 496 + 1,              # df +1
+    low_eqbound  = -clincically_relevant_bdi_delta,
+    high_eqbound = clincically_relevant_bdi_delta,
+    hypothesis   = "EQU"
+)
+print(bdi_con_hc_tost)
+```
+
+```{r}
+message("CES-D")
+bd_cesd_model <- lm(
+    cesd ~ group + sex + poly(chronological_age, 2),
+    data = bidirect_baseline
+)
+bd_cesd_anova <- Anova(bd_cesd_model, type = "III")
+print(bd_cesd_anova)
+eta_squared(bd_cesd_anova, partial = TRUE)
+bd_cesd_emm <-emmeans(bd_cesd_model, pairwise ~ group, adjust = "tukey") #  HC - CON in paper
+print(bd_cesd_emm)
+confint(bd_cesd_emm$contrasts)
+eff_size(emmeans(bd_cesd_model, ~ group), sigma = sigma(bd_cesd_model), edf = df.residual(bd_cesd_model))
+
+clincically_relevant_cesd_delta <- sigma(bd_cesd_model) * 0.5 # SD * 0.5 like Norman 2004
+cesd_con_hc_tost <- tsum_TOST(
+    m1           = 5.56,                  # Absolute estimate of the HC-CON difference
+    sd1          = 1.94 * sqrt(334 + 1),  # se + sqrt(df)
+    n1           = 334 + 1,               # df +1
+    low_eqbound  = -clincically_relevant_cesd_delta,           
+    high_eqbound = clincically_relevant_cesd_delta,            
+    hypothesis   = "EQU"
+)
+print(cesd_con_hc_tost)
+```
+
+# Vulnerability
+## mnc macs
+```{r}
+message("MNC+MACS Baseline Differences")
+mm_bag_model <- lm(
+    BAG ~ group + poly(chronological_age, 2) + sex + tiv + scanner, 
+    data = mnc_macs_baseline
+)
+mm_bag_anova <- Anova(mm_bag_model, type = "III")
+print(mm_bag_anova)
+eta_squared(mm_bag_anova, partial = TRUE)
+cat("\n\n")
+
+# post-hoc contrasts
+mm_bag_contrasts <- emmeans(mm_bag_model, pairwise ~ group, adjust = "tukey")
+print(mm_bag_contrasts$contrasts)
+# 95% Tukey-adjusted confidence intervals for each group contrast
+mm_bag_contrasts_ci <- confint(mm_bag_contrasts$contrasts, level = 0.95)
+print(mm_bag_contrasts_ci)
+
+eff_size(emmeans(mm_bag_model, ~ group), sigma = sigma(mm_bag_model), edf = df.residual(mm_bag_model))
+
+cat("TOST Equivalence Testing:\n")
+mm_vul_contrasts_df <- as.data.frame(mm_bag_contrasts$contrasts)
+hc_con <- mm_vul_contrasts_df[mm_vul_contrasts_df$contrast == "HC - CON", ]
+hc_mdd <- mm_vul_contrasts_df[mm_vul_contrasts_df$contrast == "HC - MDD", ]
+
+mm_vul_tost_delta <- abs(hc_mdd$estimate)
+
+mm_vul_adjusted_tost <- tsum_TOST(
+    m1           = hc_con$estimate,
+    sd1          = hc_con$SE * sqrt(hc_con$df + 1),
+    n1           = hc_con$df + 1,
+    low_eqbound  = -mm_vul_tost_delta,
+    high_eqbound = mm_vul_tost_delta,
+    hypothesis   = "EQU"
+)
+print(mm_vul_adjusted_tost)
+```
+
+```{r}
+message("MNC+MACS Baseline Differences - JAMA unadjusted")
+mm_bag_model_unadjusted <- lm(
+    BAG ~ group + poly(chronological_age, 2),
+    data = mnc_macs_baseline
+)
+mm_bag_anova_unadjusted <- Anova(mm_bag_model_unadjusted, type = "III")
+print(mm_bag_anova_unadjusted)
+eta_squared(mm_bag_anova_unadjusted, partial = TRUE)
+cat("\n\n")
+
+# post-hoc contrasts
+mm_bag_contrasts_unadjusted <- emmeans(mm_bag_model_unadjusted, pairwise ~ group, adjust = "tukey")
+print(mm_bag_contrasts_unadjusted$contrasts)
+# 95% Tukey-adjusted confidence intervals for each group contrast
+mm_bag_contrasts_unadjusted_ci <- confint(mm_bag_contrasts_unadjusted$contrasts, level = 0.95)
+print(mm_bag_contrasts_unadjusted_ci)
+
+eff_size(emmeans(mm_bag_model_unadjusted, ~ group), sigma = sigma(mm_bag_model_unadjusted), edf = df.residual(mm_bag_model_unadjusted))
+```
+```{r}
+mm_sensitivity_model <- lm(
+    BAG ~ group + BMI + medindex + poly(chronological_age, 2) + sex + tiv + scanner, 
+    data = mnc_macs_baseline
+)
+
+summary(mm_sensitivity_model)
+Anova(mm_sensitivity_model, type = "III")
+
+round(cbind(
+  Estimate = coef(mm_sensitivity_model),
+  confint(mm_sensitivity_model),
+  P = summary(mm_sensitivity_model)$coefficients[, "Pr(>|t|)"]
+), 3)
+```
+
+## bidirect
+```{r}
+message("BiDirect Baseline Differences")
+bd_bag_model <- lm(
+    BAG ~ group + poly(chronological_age, 2) + sex + tiv, 
+    data = bidirect_baseline
+)
+
+bd_bag_anova <- Anova(bd_bag_model, type = "III")
+print(bd_bag_anova)
+eta_squared(bd_bag_anova, partial = TRUE)
+cat("\n\n")
+
+# post-hoc contrasts
+bd_bag_contrasts <- emmeans(bd_bag_model, pairwise ~ group, adjust = "tukey")
+print(bd_bag_contrasts$contrasts)
+bd_bag_contrasts_ci <- confint(bd_bag_contrasts$contrasts, level = 0.95)
+print(bd_bag_contrasts_ci)
+
+eff_size(emmeans(bd_bag_model, ~ group), sigma = sigma(bd_bag_model), edf = df.residual(bd_bag_model))
+
+cat("TOST Equivalence Testing:\n")
+bd_vul_contrasts_df <- as.data.frame(bd_bag_contrasts$contrasts)
+bd_hc_con <- bd_vul_contrasts_df[bd_vul_contrasts_df$contrast == "HC - CON", ]
+bd_hc_mdd <- bd_vul_contrasts_df[bd_vul_contrasts_df$contrast == "HC - MDD", ]
+
+bd_vul_tost_delta <- abs(bd_hc_mdd$estimate)
+bd_vul_adjusted_tost <- tsum_TOST(
+    m1          = bd_hc_con$estimate,
+    sd1         = bd_hc_con$SE * sqrt(bd_hc_con$df + 1),
+    n1          = bd_hc_con$df + 1,
+    low_eqbound = -bd_vul_tost_delta,
+    high_eqbound = bd_vul_tost_delta,
+    hypothesis  = "EQU"
+)
+print(bd_vul_adjusted_tost)
+```
+
+```{r}
+message("BiDirect Baseline Differences - JAMA unadjusted")
+bd_bag_model_unadjusted <- lm(
+    BAG ~ group + poly(chronological_age, 2), 
+    data = bidirect_baseline
+)
+
+# Important: Type III Sum of Squares
+bd_bag_anova_unadjusted <- Anova(bd_bag_model_unadjusted, type = "III")
+print(bd_bag_anova_unadjusted)
+eta_squared(bd_bag_anova_unadjusted, partial = TRUE)
+cat("\n\n")
+
+# post-hoc contrasts
+bd_bag_contrasts_unadjusted <- emmeans(bd_bag_model_unadjusted, pairwise ~ group, adjust = "tukey")
+print(bd_bag_contrasts_unadjusted$contrasts)
+# 95% Tukey-adjusted confidence intervals for each group contrast
+bd_bag_contrasts_ci_unadjusted <- confint(bd_bag_contrasts_unadjusted$contrasts, level = 0.95)
+print(bd_bag_contrasts_ci_unadjusted)
+
+eff_size(emmeans(bd_bag_model_unadjusted, ~ group), sigma = sigma(bd_bag_model_unadjusted), edf = df.residual(bd_bag_model_unadjusted))
+```
+```{r}
+mm_bag_plot <- ggplot(mnc_macs_baseline, aes(x = group, y = BAG, fill = group)) +
+    ggtitle("Discovery Dataset") +
+    ylim(-40, 25) +
+    geom_violin(alpha = 0.4, color = NA, trim = FALSE) +
+    geom_jitter(width = 0.15, alpha = 0.4, size = 1.5, color = "darkgray") +
+    geom_boxplot(width = 0.2, outlier.shape = NA, alpha = 0.8, color = "black") +
+    geom_signif(
+        comparisons = list(c("HC", "MDD"), c("HC", "CON")), #, c("MDD", "CON")),
+        map_signif_level = FALSE,  # FALSE prints the text you supply, TRUE prints stars
+        annotations = c("p = .005", "n.s."), #, "n.s."),
+        y_position = c(14, 18), # , 22),    # Adjust these numbers so they sit nicely above your data
+        tip_length = 0.02,
+        textsize = 4
+    ) +
+    scale_fill_manual(values = c("HC" = "#56B4E9", "CON" = "#9e009b", "MDD" = "#D55E00")) +
+    labs(
+        y = "Baseline BAG", x=""
+    ) +
+    theme_classic(base_size = 14) +
+    theme(
+        legend.position = "none",
+        axis.text.x = element_text(face = "bold", size = 12),
+        plot.title = element_text(size=12, hjust=1)
+    )
+
+bd_bag_plot <- ggplot(bidirect_baseline, aes(x = group, y = BAG, fill = group)) +
+    ggtitle("Replication Dataset") +
+    ylim(-40, 25) +
+    geom_violin(alpha = 0.4, color = NA, trim = FALSE) +
+    geom_jitter(width = 0.15, alpha = 0.4, size = 1.5, color = "darkgray") +
+    geom_boxplot(width = 0.2, outlier.shape = NA, alpha = 0.8, color = "black") +
+    geom_signif(
+        comparisons = list(c("HC", "MDD"), c("HC", "CON")), # , c("MDD", "CON")),
+        map_signif_level = FALSE,
+        annotations = c("p = .012", "n.s."), # , "n.s."),
+        y_position = c(14, 18), # , 22),
+        tip_length = 0.02,
+        textsize = 4) +
+    scale_fill_manual(values = c("HC" = "#56B4E9", "CON" = "#9e009b", "MDD" = "#D55E00")) +
+    labs(
+        y = "", x=""
+    ) +
+    theme_classic(base_size = 14) +
+    theme(
+        legend.position = "none",
+        axis.text.x = element_text(face = "bold", size = 12),
+        plot.title = element_text(size=12, hjust=.5)
+    )
+
+thm <- theme(plot.title = element_text(face = 2, size = 12))
+left_plot  <- wrap_elements(mm_bag_plot + plot_annotation(title = "(A)", theme = thm))
+right_plot <- wrap_elements(bd_bag_plot + plot_annotation(title = "(B)", theme = thm))
+
+bag_plot <- left_plot + right_plot
+print(bag_plot)
+ggsave("Analysis_1_Violin.png", bag_plot, width = 6, height = 5)
+```
+
+```{r}
+hc_mean_mm <- mean(mnc_macs_baseline$BAG[mnc_macs_baseline$group == "HC"], na.rm = TRUE)
+mnc_macs_baseline$BAG_centered <- mnc_macs_baseline$BAG - hc_mean_mm
+hc_mean_bd <- mean(bidirect_baseline$BAG[bidirect_baseline$group == "HC"], na.rm = TRUE)
+bidirect_baseline$BAG_centered <- bidirect_baseline$BAG - hc_mean_bd
+
+mm_bag_plot <- ggplot(mnc_macs_baseline, aes(x = group, y = BAG_centered, fill = group)) +
+    ggtitle("Discovery Dataset") +
+    geom_violin(alpha = 0.4, color = NA, trim = FALSE) +
+    geom_jitter(width = 0.15, alpha = 0.4, size = 1.5, color = "darkgray") +
+    geom_boxplot(width = 0.2, outlier.shape = NA, alpha = 0.8, color = "black") +
+    geom_signif(
+        comparisons = list(c("HC", "MDD"), c("HC", "CON")),
+        map_signif_level = FALSE,  
+        annotations = c("p = .008", "n.s."),
+        y_position = c(18, 22),    # Lowered slightly to fit the new centered scale nicely
+        tip_length = 0.02,
+        textsize = 4
+    ) +
+    scale_fill_manual(values = c("HC" = "#56B4E9", "CON" = "#009E73", "MDD" = "#D55E00")) +
+    scale_y_continuous(breaks = seq(-25, 25, by = 5)) +
+    labs(
+        y = "BAG at Baseline", x=""
+    ) +
+    coord_cartesian(ylim = c(-25, 25)) +
+    theme_classic(base_size = 14) +
+    theme(
+        legend.position = "none",  
+        axis.text.x = element_text(face = "bold", size = 12),
+        plot.title = element_text(size=12, hjust=1)
+    )
+
+bd_bag_plot <- ggplot(bidirect_baseline, aes(x = group, y = BAG_centered, fill = group)) +
+    ggtitle("Replication Dataset") +
+    geom_violin(alpha = 0.4, color = NA, trim = FALSE) +
+    geom_jitter(width = 0.15, alpha = 0.4, size = 1.5, color = "darkgray") +
+    geom_boxplot(width = 0.2, outlier.shape = NA, alpha = 0.8, color = "black") +
+    geom_signif(
+        comparisons = list(c("HC", "MDD"), c("HC", "CON")),
+        map_signif_level = FALSE,
+        annotations = c("p = .012", "n.s."),
+        y_position = c(18, 22),
+        tip_length = 0.02,
+        textsize = 4) +
+    scale_fill_manual(values = c("HC" = "#56B4E9", "CON" = "#009E73", "MDD" = "#D55E00")) +
+    scale_y_continuous(breaks = seq(-25, 25, by = 5)) +
+    labs(
+        y = "", x=""
+    ) +
+    coord_cartesian(ylim = c(-25, 25)) + 
+    theme_classic(base_size = 14) +
+    theme(
+        legend.position = "none",
+        axis.text.x = element_text(face = "bold", size = 12),
+        plot.title = element_text(size=12, hjust=.5)
+    )
+
+thm <- theme(plot.title = element_text(face = 2, size = 12))
+left_plot  <- wrap_elements(mm_bag_plot + plot_annotation(title = "(A)", theme = thm))
+right_plot <- wrap_elements(bd_bag_plot + plot_annotation(title = "(B)", theme = thm))
+
+bag_plot <- left_plot + right_plot
+print(bag_plot)
+ggsave("Analysis_1_Violin_Centered.png", bag_plot, width = 6, height = 5)
+```
+# State
+## Trajectory differences
+### mnc macs
+```{r}
+mm_lmer_anova <- Anova(mnc_macs_lmer_model, type = "3", test.statistic = "F") # Type III ANOVA to test the interaction effect
+print(mm_lmer_anova)
+cat("\n--- fixed effects (effect strengths) ---\n")
+eta_squared(mm_lmer_anova, partial = TRUE)
+mm_lmer_slopes <- emtrends(mnc_macs_lmer_model, pairwise ~ group, var = "assessment_exact")
+cat("\n--- Slopes (emtrends) ---\n")
+summary(mm_lmer_slopes$emtrends)
+cat("\n--- Slopes (contrasts) ---\n")
+summary(mm_lmer_slopes$contrasts)
+confint(mm_lmer_slopes$contrasts)
+
+mm_slope_effect_sizes <- eff_size(
+    mm_lmer_slopes$emtrends,
+    sigma = sigma(mnc_macs_lmer_model),
+    edf = df.residual(mnc_macs_lmer_model)
+)
+cat("\n--- Standardized Effect Sizes (Cohen's d) for Slope Differences ---\n")
+summary(mm_slope_effect_sizes)
+```
+
+```{r}
+mm_slopes_df <- as.data.frame(mm_lmer_slopes$contrasts)
+
+# Calculate the raw equivalence bound corresponding to d = 0.20
+mm_eq_bound_raw <- 0.20 * sigma(mnc_macs_lmer_model)
+cat(sprintf("Raw equivalence boundary for d = 0.20: +/- %.4f BAG years/year\n\n", mm_eq_bound_raw))
+
+mm_hc_con_slope  <- mm_slopes_df[mm_slopes_df$contrast == "HC - CON", ]
+mm_con_mdd_slope <- mm_slopes_df[mm_slopes_df$contrast == "MDD - CON", ]
+
+# === TOST 1: CON vs. HC ===
+cat("=== TOSTER: Is the CON slope equivalent to the HC slope? ===\n")
+mm_tost_con_hc <- tsum_TOST(
+    m1           = mm_hc_con_slope$estimate,
+    sd1          = mm_hc_con_slope$SE * sqrt(round(mm_hc_con_slope$df) + 1),
+    n1           = round(mm_hc_con_slope$df) + 1,
+    low_eqbound  = -mm_eq_bound_raw,
+    high_eqbound = mm_eq_bound_raw,
+    eqbound_type = "raw",
+    hypothesis   = "EQU"
+)
+print(mm_tost_con_hc)
+
+# === TOST 2: CON vs. MDD ===
+cat("\n=== TOSTER: Is the CON slope equivalent to the MDD slope? ===\n")
+mm_tost_con_mdd <- tsum_TOST(
+    m1           = mm_con_mdd_slope$estimate,
+    sd1          = mm_con_mdd_slope$SE * sqrt(round(mm_con_mdd_slope$df) + 1),
+    n1           = round(mm_con_mdd_slope$df) + 1,
+    low_eqbound  = -mm_eq_bound_raw,
+    high_eqbound = mm_eq_bound_raw,
+    eqbound_type = "raw",
+    hypothesis   = "EQU"
+)
+print(mm_tost_con_mdd)
+```
+
+### bidirect
+```{r}
+bidirect_lmer_anova <- Anova(bidirect_lmer_model, type = "3", test.statistic = "F") # Type III ANOVA to test the interaction effect
+print(bidirect_lmer_anova)
+cat("\n--- fixed effects (effect strengths) ---\n")
+eta_squared(bidirect_lmer_anova, partial = TRUE)
+bidirect_lmer_slopes <- emtrends(bidirect_lmer_model, pairwise ~ group, var = "assessment_exact")
+cat("\n--- Slopes (emtrends) ---\n")
+summary(bidirect_lmer_slopes$emtrends)
+cat("\n--- Slopes (contrasts) ---\n")
+summary(bidirect_lmer_slopes$contrasts)
+confint(bidirect_lmer_slopes$contrasts)
+
+bidirect_slope_effect_sizes <- eff_size(
+    bidirect_lmer_slopes$emtrends, 
+    sigma = sigma(bidirect_lmer_model), 
+    edf = df.residual(bidirect_lmer_model)
+)
+cat("\n--- Standardized Effect Sizes (Cohen's d) for Slope Differences ---\n")
+summary(bidirect_slope_effect_sizes)
+```
+
+```{r}
+bidirect_slopes_df <- as.data.frame(bidirect_lmer_slopes$contrasts)
+
+# Calculate the raw equivalence bound corresponding to d = 0.20
+bidirect_eq_bound_raw <- 0.20 * sigma(bidirect_lmer_model)
+cat(sprintf("Raw equivalence boundary for d = 0.20: +/- %.4f BAG years/year\n\n", bidirect_eq_bound_raw))
+
+bidirect_hc_con_slope  <- bidirect_slopes_df[bidirect_slopes_df$contrast == "HC - CON", ]
+bidirect_con_mdd_slope <- bidirect_slopes_df[bidirect_slopes_df$contrast == "MDD - CON", ]
+
+# === TOST 1: CON vs. HC ===
+cat("=== TOSTER: Is the CON slope equivalent to the HC slope? ===\n")
+bidirect_tost_con_hc <- tsum_TOST(
+    m1           = bidirect_hc_con_slope$estimate,
+    sd1          = bidirect_hc_con_slope$SE * sqrt(round(bidirect_hc_con_slope$df) + 1),
+    n1           = round(bidirect_hc_con_slope$df) + 1,
+    low_eqbound  = -bidirect_eq_bound_raw,
+    high_eqbound = bidirect_eq_bound_raw,
+    eqbound_type = "raw",
+    hypothesis   = "EQU"
+)
+print(bidirect_tost_con_hc)
+
+# === TOST 2: CON vs. MDD ===
+cat("\n=== TOSTER: Is the CON slope equivalent to the MDD slope? ===\n")
+bidirect_tost_con_mdd <- tsum_TOST(
+    m1           = bidirect_con_mdd_slope$estimate,
+    sd1          = bidirect_con_mdd_slope$SE * sqrt(round(bidirect_con_mdd_slope$df) + 1),
+    n1           = round(bidirect_con_mdd_slope$df) + 1,
+    low_eqbound  = -bidirect_eq_bound_raw,
+    high_eqbound = bidirect_eq_bound_raw,
+    eqbound_type = "raw",
+    hypothesis   = "EQU"
+)
+print(bidirect_tost_con_mdd)
+```
+
+```{r}
+bidirect_predictions <- as.data.frame(
+  ggpredict(bidirect_lmer_model, terms = c("assessment_exact [all]", "group"))
+)
+baseline_hc_bid <- bidirect_predictions$predicted[
+  bidirect_predictions$group == "HC" & bidirect_predictions$x == min(bidirect_predictions$x)
+]
+bidirect_predictions$predicted_centered <- bidirect_predictions$predicted - baseline_hc_bid
+bidirect_predictions$cohort <- "Replication"
+
+mm_predictions <- as.data.frame(
+  ggpredict(mnc_macs_lmer_model, terms = c("assessment_exact [all]", "group"))
+)
+baseline_hc_mm <- mm_predictions$predicted[
+  mm_predictions$group == "HC" & mm_predictions$x == min(mm_predictions$x)
+]
+mm_predictions$predicted_centered <- mm_predictions$predicted - baseline_hc_mm
+mm_predictions$cohort <- "Discovery"
+
+combined_predictions <- rbind(mm_predictions, bidirect_predictions)
+
+unified_long_bag_plot <- ggplot(combined_predictions, 
+                                aes(x = x, y = predicted_centered, color = group, linetype = cohort)) +
+    geom_line(linewidth = 1) +
+    xlim(0, 3) + 
+    scale_color_manual(values = c("HC" = "#56B4E9", "CON" = "#9e009b", "MDD" = "#D55E00")) +
+    scale_linetype_manual(values = c("Discovery" = "solid", "Replication" = "dotted")) +
+    labs(
+        y = "Brain Age Gap",
+        x = "Time from Baseline (Years)",
+        color = "Group",
+        linetype = "Dataset"
+    ) +
+    theme_classic(base_size = 14) +
+    theme(
+        plot.title = element_text(size = 14, hjust = 0.5, face = "bold"),
+        axis.title.y = element_text(size = 11),
+        axis.text.y = element_text(size = 10),
+        axis.title.x = element_text(size = 11),
+        axis.text.x = element_text(size = 10),
+
+        legend.position = "bottom",
+        legend.box = "vertical",
+        legend.direction = "horizontal",
+        legend.margin = margin(t = -10, b = 0),
+        legend.title = element_text(size = 10, face = "bold"),
+        legend.text = element_text(size = 10)
+    )
+
+print(unified_long_bag_plot)
+ggsave("Analysis_2_Line_zeroed.png", unified_long_bag_plot, width = 6, height = 4)
+```
+
+```{r}
+bidirect_predictions <- ggpredict(bidirect_lmer_model, terms = c("assessment_exact [all]", "group"))
+bidirect_adjusted_long_bag_plot <- ggplot(bidirect_predictions, aes(x = x, y = predicted, color = group)) +
+    geom_line(linewidth = 1) +
+    xlim(0, 3) + ylim(-18, -7.5) +
+    scale_color_manual(values = c("HC" = "#56B4E9", "CON" = "#009E73", "MDD" = "#D55E00")) +
+    labs(
+        title = "BiDirect Sample",
+        y = "Brain Age Gap",
+        x = "Time from Baseline (Years)",
+        color = "Group"
+    ) +
+    theme_classic(base_size = 14) +
+    theme(
+        plot.title = element_text(size=12, hjust=.5),
+        axis.title.y = element_text(size = 10),
+        axis.text.y = element_text(size = 10),
+        axis.title.x = element_text(size = 10),
+        axis.text.x = element_text(size = 10),
+        legend.position = 'bottom'
+    )
+
+mm_predictions <- ggpredict(mnc_macs_lmer_model, terms = c("assessment_exact [all]", "group"))
+mm_adjusted_long_bag_plot <- ggplot(mm_predictions, aes(x = x, y = predicted, color = group)) +
+    geom_line(linewidth = 1) + 
+    xlim(0, 3) + ylim(-18, -7.5) +
+    scale_color_manual(values = c("HC" = "#56B4E9", "CON" = "#009E73", "MDD" = "#D55E00")) +
+    labs(
+        title = "MACS + MNC Sample",
+        y = "Brain Age Gap",
+        x = "Time from Baseline (Years)",
+        color = "Group"
+    ) +
+    theme_classic(base_size = 14) +
+    theme(
+        plot.title = element_text(size=12, hjust=.5),
+        axis.title.y = element_text(size = 10),
+        axis.text.y = element_text(size = 10),
+        axis.title.x = element_text(size = 10),
+        axis.text.x = element_text(size = 10),
+        legend.position = 'bottom'
+    )
+
+adjusted_long_bag_plot <- mm_adjusted_long_bag_plot + bidirect_adjusted_long_bag_plot + 
+  plot_layout(ncol = 2, guides = "collect") + 
+  plot_annotation(
+    tag_levels = 'A', 
+    tag_prefix = '(', 
+    tag_suffix = ')'
+  ) & 
+  theme(
+    legend.position = "bottom",
+    plot.tag = element_text(face = "bold", size = 14),
+    plot.tag.position = c(0, 1)
+  )
+print(adjusted_long_bag_plot)
+ggsave("Analysis_2_Line.png", adjusted_long_bag_plot, width = 6, height = 4)
+```
+
+## follow-up differences via Cross-Sectional analysis
+### macs + mnc
+```{r}
+print("Cross-sectional Association at Follow-up")
+print("HAMD17")
+mm_hamd_state_model <- lm(BAG ~ HAMD17 + poly(chronological_age, 2) + sex + tiv + scanner, data = mm_clinical_followup)
+mm_hamd_state_anova <- Anova(mm_hamd_state_model, type = "III")
+print(mm_hamd_state_anova)
+eta_squared(mm_hamd_state_anova, partial = TRUE)
+
+mm_hamd_state_pcorr <- t_to_r(
+    t = summary(mm_hamd_state_model)$coefficients["HAMD17", "t value"],
+    df_error = mm_hamd_state_model$df.residual
+)
+print("partial correlation:")
+print(mm_hamd_state_pcorr)
+
+print("group effect:")
+print(Anova(lm(BAG ~ group + HAMD17 + poly(chronological_age, 2) + sex + tiv + scanner, data = mm_clinical_followup), type = "III"))
+
+print("BDI")
+mm_bdi_state_model <- lm(BAG ~ bdi + poly(chronological_age, 2) + sex + tiv + scanner, data = mm_clinical_followup)
+mm_bdi_state_anova <- Anova(mm_bdi_state_model, type = "III")
+print(mm_bdi_state_anova)
+eta_squared(mm_bdi_state_anova, partial = TRUE)
+
+mm_bdi_state_pcorr <- t_to_r(
+    t = summary(mm_bdi_state_model)$coefficients["bdi", "t value"],
+    df_error = mm_bdi_state_model$df.residual
+)
+print("partial correlation:")
+print(mm_bdi_state_pcorr, digits=4)
+
+print("group effect:")
+print(Anova(lm(BAG ~ group + bdi + poly(chronological_age, 2) + sex + tiv + scanner, data = mm_clinical_followup), type = "III"))
+```
+
+```{r}
+tost_hamd_assoc <- corsum_test(
+    r = -0.004,
+    n = 205 + 1, # df + 1
+    alternative = "equivalence",
+    null = 0.10,
+    method = "pearson"
+)
+print(tost_hamd_assoc)
+
+tost_bdi_assoc <- corsum_test(
+    r = 0.022,
+    n = 190 + 1, # df + 1
+    alternative = "equivalence",
+    null = 0.10,
+    method = "pearson"
+)
+print(tost_bdi_assoc)
+```
+
+### bidirect
+```{r}
+print("Cross-sectional Association at Follow-up - CESD")
+bd_cesd_state_model <- lm(BAG ~ cesd + poly(chronological_age, 2) + sex + tiv, data = bd_clinical_followup)
+bd_cesd_state_anova <- Anova(bd_cesd_state_model, type = "III")
+print(bd_cesd_state_anova)
+eta_squared(bd_cesd_state_anova, partial = TRUE)
+
+bd_cesd_state_pcorr <- t_to_r(
+    t = summary(bd_cesd_state_model)$coefficients["cesd", "t value"],
+    df_error = bd_cesd_state_model$df.residual
+)
+print("partial correlation:")
+print(bd_cesd_state_pcorr, digits=4)
+```
+
+```{r}
+tost_cesd_assoc <- corsum_test(
+    r = -0.087,
+    n = 116 + 1,
+    alternative = "equivalence",
+    null = 0.10,
+    method = "pearson"
+)
+print(tost_cesd_assoc)
+```
+## longitudinal differences via Change-Score Analysis
+### macs + mnc
+```{r}
+mm_clinical_delta_data <- mnc_macs_longitudinal %>%
+    group_by(subject_id) %>%
+    filter(n() > 1, group %in% c("CON", "MDD")) %>%
+    summarize(
+        delta_bag  = BAG[assessment_exact != 0] - BAG[assessment_exact == 0],
+        delta_hamd = HAMD17[assessment_exact != 0] - HAMD17[assessment_exact == 0],
+        delta_bdi  = bdi[assessment_exact != 0] - bdi[assessment_exact == 0],
+        chronological_age_baseline = chronological_age[assessment_exact == 0],
+        sex = first(sex),
+        tiv = first(tiv),
+        scanner = first(scanner),
+        group = first(group)
+    )
+
+print("Longitudinal Change Scores - delta HAMD")
+
+mm_hamd_delta_model <- lm(
+    delta_bag ~ delta_hamd + poly(chronological_age_baseline, 2) + sex + tiv + scanner, 
+    data = mm_clinical_delta_data
+)
+mm_hamd_delta_anova <- Anova(mm_hamd_delta_model, type = "III")
+print(mm_hamd_delta_anova)
+eta_squared(mm_hamd_delta_anova, partial = TRUE)
+mm_hamd_delta_pcorr <- t_to_r(
+    t = summary(mm_hamd_delta_model)$coefficients["delta_hamd", "t value"],
+    df_error = mm_hamd_delta_model$df.residual
+)
+
+print("partial correlation:")
+print(mm_hamd_delta_pcorr, digits=4)
+
+print("Longitudinal Change Scores - delta BDI")
+mm_bdi_delta_model <- lm(
+    delta_bag ~ delta_bdi + poly(chronological_age_baseline, 2) + sex + tiv + scanner, 
+    data = mm_clinical_delta_data
+)
+mm_bdi_delta_anova <- Anova(mm_bdi_delta_model, type = "III")
+print(mm_bdi_delta_anova)
+eta_squared(mm_bdi_delta_anova, partial = TRUE)
+mm_bdi_delta_pcorr <- t_to_r(
+    t = summary(mm_bdi_delta_model)$coefficients["delta_bdi", "t value"],
+    df_error = mm_bdi_delta_model$df.residual
+)
+print("partial correlation:")
+print(mm_bdi_delta_pcorr, digits=4)
+```
+
+```{r}
+cat("\nHAM-D TOST:\n")
+tost_hamd_delta_assoc <- corsum_test(
+    r = -0.0024,
+    n = 204 + 1, # df + 1
+    alternative = "equivalence",
+    null = 0.10,
+    method = "pearson"
+)
+print(tost_hamd_delta_assoc)
+
+cat("\nBDI TOST:\n")
+tost_bdi_delta_assoc <- corsum_test(
+    r = 0.0166,
+    n = 185 + 1, # df + 1
+    alternative = "equivalence",
+    null = 0.10,
+    method = "pearson"
+)
+print(tost_bdi_delta_assoc)
+```
+
+### bidirect
+```{r}
+bd_clinical_delta_data <- bidirect_longitudinal %>%
+    group_by(subject_id) %>%
+    filter(n() > 1, group %in% c("CON", "MDD")) %>%
+    summarize(
+        delta_bag  = BAG[assessment_exact != 0] - BAG[assessment_exact == 0],
+        delta_cesd = cesd[assessment_exact != 0] - cesd[assessment_exact == 0],
+        chronological_age_baseline = chronological_age[assessment_exact == 0],
+        sex = first(sex),
+        tiv = first(tiv),
+        scanner = first(scanner),
+        group = first(group)
+    )
+
+print("Longitudinal Change Scores - delta CESD")
+bd_cesd_delta_model <- lm(
+    delta_bag ~ delta_cesd + poly(chronological_age_baseline, 2) + sex + tiv, 
+    data = bd_clinical_delta_data
+)
+bd_cesd_delta_anova <- Anova(bd_cesd_delta_model, type = "III")
+print(bd_cesd_delta_anova)
+eta_squared(bd_cesd_delta_anova, partial = TRUE)
+
+bd_cesd_delta_pcorr <- t_to_r(
+    t = summary(bd_cesd_delta_model)$coefficients["delta_cesd", "t value"],
+    df_error = bd_cesd_delta_model$df.residual
+)
+print("partial correlation:")
+print(bd_cesd_delta_pcorr, digits=4)
+```
+
+```{r}
+cat("\nCES-D TOST:\n")
+tost_cesd_delta_assoc <- corsum_test(
+    r = 0.1611,    # observed partial correlation
+    n = 115 + 1,   # df + 1
+    alternative = "equivalence",
+    null = 0.10,
+    method = "pearson"
+)
+print(tost_cesd_delta_assoc)
+```
+
+## correlation chart
+```{r}
+# Cross-Sectional State (Follow-up)
+mm_fit_cross <- "poly(chronological_age, 2) + sex + tiv + scanner"
+mm_corr_plot_cross <- mm_clinical_followup %>%
+  mutate(
+    bag_res  = residuals(lm(as.formula(paste("BAG ~", mm_fit_cross)), data = ., na.action = na.exclude)),
+    hamd_res = residuals(lm(as.formula(paste("HAMD17 ~", mm_fit_cross)), data = ., na.action = na.exclude)),
+    bdi_res  = residuals(lm(as.formula(paste("bdi ~", mm_fit_cross)), data = ., na.action = na.exclude))
+  )
+
+bd_fit_cross <- "poly(chronological_age, 2) + sex + tiv"
+bd_corr_plot_cross <- bd_clinical_followup %>%
+  mutate(
+    bag_res  = residuals(lm(as.formula(paste("BAG ~", bd_fit_cross)), data = ., na.action = na.exclude)),
+    cesd_res = residuals(lm(as.formula(paste("cesd ~", bd_fit_cross)), data = ., na.action = na.exclude))
+  )
+
+# Longitudinal Course (Change Scores)
+mm_fit_long <- "poly(chronological_age_baseline, 2) + sex + scanner"
+mm_corr_plot_long <- mm_clinical_delta_data %>%
+  mutate(
+    d_bag_res  = residuals(lm(as.formula(paste("delta_bag ~", mm_fit_long)), data = ., na.action = na.exclude)),
+    d_hamd_res = residuals(lm(as.formula(paste("delta_hamd ~", mm_fit_long)), data = ., na.action = na.exclude)),
+    d_bdi_res  = residuals(lm(as.formula(paste("delta_bdi ~", mm_fit_long)), data = ., na.action = na.exclude))
+  )
+
+bd_fit_long <- "poly(chronological_age_baseline, 2) + sex + tiv"
+bd_corr_plot_long <- bd_clinical_delta_data %>%
+  mutate(
+    d_bag_res  = residuals(lm(as.formula(paste("delta_bag ~", bd_fit_long)), data = ., na.action = na.exclude)),
+    d_cesd_res = residuals(lm(as.formula(paste("delta_cesd ~", bd_fit_long)), data = ., na.action = na.exclude))
+  )
+
+label_h_cross <- paste0("italic(r) == '", sprintf("%.3f", mm_hamd_state_pcorr[1, "r"]), 
+                        "'~~~~italic(p) == '", sprintf("%.3f", mm_hamd_state_anova["HAMD17","Pr(>F)"]), "'")
+
+label_b_cross <- paste0("italic(r) == '", sprintf("%.3f", mm_bdi_state_pcorr[1, "r"]), 
+                        "'~~~~italic(p) == '", sprintf("%.3f", mm_bdi_state_anova["bdi","Pr(>F)"]), "'")
+
+label_c_cross <- paste0("italic(r) == '", sprintf("%.3f", bd_cesd_state_pcorr[1, "r"]), 
+                        "'~~~~italic(p) == '", sprintf("%.3f", bd_cesd_state_anova["cesd","Pr(>F)"]), "'")
+
+label_h_change <- paste0("italic(r) == '", sprintf("%.3f", mm_hamd_delta_pcorr[1, "r"]), 
+                         "'~~~~italic(p) == '", sprintf("%.3f", mm_hamd_delta_anova["delta_hamd","Pr(>F)"]), "'")
+
+label_b_change <- paste0("italic(r) == '", sprintf("%.3f", mm_bdi_delta_pcorr[1, "r"]), 
+                         "'~~~~italic(p) == '", sprintf("%.3f", mm_bdi_delta_anova["delta_bdi","Pr(>F)"]), "'")
+
+label_c_change <- paste0("italic(r) == '", sprintf("%.3f", bd_cesd_delta_pcorr[1, "r"]), 
+                         "'~~~~italic(p) == '", sprintf("%.3f", bd_cesd_delta_anova["delta_cesd","Pr(>F)"]), "'")
+
+
+# ==========================================
+# 3. PLOTTING WITH ANNOTATIONS
+# ==========================================
+
+thm <- theme_classic(base_size = 12) + 
+       theme(plot.title = element_text(face = "bold", size = 14))
+
+# Panel A1: HAMD State
+p_h_cross <- ggplot(mm_corr_plot_cross, aes(x = hamd_res, y = bag_res)) +
+  ylim(-10, 10) +
+  geom_point(alpha = 0.4, color = "#2C3E50") +
+  geom_smooth(method = "lm", color = "#2C3E50", fill = "#2C3E50", alpha = 0.2) +
+  annotate("text", x = Inf, y = Inf, label = label_h_cross, parse = TRUE, 
+           hjust = 1.1, vjust = 1.5, size = 3.5, fontface = "plain") +
+  labs(title = "", x = "HAMD-17 (Adjusted)", y = "BAG (Adjusted)") + thm
+
+# Panel A2: BDI State
+p_b_cross <- ggplot(mm_corr_plot_cross, aes(x = bdi_res, y = bag_res)) +
+  ylim(-10, 10) +
+  geom_point(alpha = 0.4, color = "#2C3E50") +
+  geom_smooth(method = "lm", color = "#2C3E50", fill = "#2C3E50", alpha = 0.2) +
+  annotate("text", x = Inf, y = Inf, label = label_b_cross, parse = TRUE, 
+           hjust = 1.1, vjust = 1.5, size = 3.5, fontface = "plain") +
+  labs(title = "", x = "BDI (Adjusted)", y = "BAG (Adjusted)") + thm
+
+# Panel B1: HAMD Change
+p_h_change <- ggplot(mm_corr_plot_long, aes(x = d_hamd_res, y = d_bag_res)) +
+  ylim(-10, 10) +
+  geom_point(alpha = 0.4, color = "#2C3E50") +
+  geom_smooth(method = "lm", color = "#2C3E50", fill = "#2C3E50", alpha = 0.2) +
+  annotate("text", x = Inf, y = Inf, label = label_h_change, parse = TRUE, 
+           hjust = 1.1, vjust = 1.5, size = 3.5, fontface = "plain") +
+  labs(title = "", x = "\u0394HAMD-17 (Adjusted)", y = "\u0394BAG (Adjusted)") + thm
+
+# Panel B2: BDI Change
+p_b_change <- ggplot(mm_corr_plot_long, aes(x = d_bdi_res, y = d_bag_res)) +
+  ylim(-10, 10) +
+  geom_point(alpha = 0.4, color = "#2C3E50") +
+  geom_smooth(method = "lm", color = "#2C3E50", fill = "#2C3E50", alpha = 0.2) +
+  annotate("text", x = Inf, y = Inf, label = label_b_change, parse = TRUE, 
+           hjust = 1.1, vjust = 1.5, size = 3.5, fontface = "plain") +
+  labs(title = "", x = "\u0394BDI (Adjusted)", y = "\u0394BAG (Adjusted)") + thm
+
+# Panel C1: CESD State
+p_c_cross <- ggplot(bd_corr_plot_cross, aes(x = cesd_res, y = bag_res)) +
+  ylim(-10, 10) +
+  geom_point(alpha = 0.4, color = "#2C3E50") +
+  geom_smooth(method = "lm", color = "#2C3E50", fill = "#2C3E50", alpha = 0.2) +
+  annotate("text", x = Inf, y = Inf, label = label_c_cross, parse = TRUE, 
+           hjust = 1.1, vjust = 1.5, size = 3.5, fontface = "plain") +
+  labs(title = "", x = "CES-D (Adjusted)", y = "BAG (Adjusted)") + thm
+
+# Panel C2: CESD Change
+p_c_change <- ggplot(bd_corr_plot_long, aes(x = d_cesd_res, y = d_bag_res)) +
+  ylim(-10, 10) +
+  geom_point(alpha = 0.4, color = "#2C3E50") +
+  geom_smooth(method = "lm", color = "#2C3E50", fill = "#2C3E50", alpha = 0.2) +
+  annotate("text", x = Inf, y = Inf, label = label_c_change, parse = TRUE, 
+           hjust = 1.1, vjust = 1.5, size = 3.5, fontface = "plain") +
+  labs(title = "", x = "\u0394CES-D (Adjusted)", y = "\u0394BAG (Adjusted)") + thm
+
+
+# ==========================================
+# 4. COMBINE AND SAVE (YOUR CODE)
+# ==========================================
+
+state_marker_plot_cross <- p_h_cross + p_b_cross + p_c_cross +
+  plot_annotation(tag_levels = 'A', tag_prefix = '(', tag_suffix = ')')
+state_marker_plot_change <- p_h_change + p_b_change + p_c_change +
+  plot_annotation(tag_levels = 'A', tag_prefix = '(', tag_suffix = ')')
+
+ggsave("Analysis_2_Scatter_cross.png", state_marker_plot_cross, width = 9, height = 3)
+ggsave("Analysis_2_Scatter_change.png", state_marker_plot_change, width = 9, height = 3)
+```
+
+```{r}
+# Cross-Sectional State (Follow-up)
+# Adjusting everything for Age, Sex, TIV, and Scanner
+mm_fit_cross <- "poly(chronological_age, 2) + sex + tiv + scanner"
+mm_corr_plot_cross <- mm_clinical_followup %>%
+  mutate(
+    bag_res  = residuals(lm(as.formula(paste("BAG ~", mm_fit_cross)), data = ., na.action = na.exclude)),
+    hamd_res = residuals(lm(as.formula(paste("HAMD17 ~", mm_fit_cross)), data = ., na.action = na.exclude)),
+    bdi_res  = residuals(lm(as.formula(paste("bdi ~", mm_fit_cross)), data = ., na.action = na.exclude))
+  )
+bd_fit_cross <- "poly(chronological_age, 2) + sex + tiv"
+bd_corr_plot_cross <- bd_clinical_followup %>%
+  mutate(
+    bag_res  = residuals(lm(as.formula(paste("BAG ~", bd_fit_cross)), data = ., na.action = na.exclude)),
+    cesd_res  = residuals(lm(as.formula(paste("cesd ~", bd_fit_cross)), data = ., na.action = na.exclude))
+  )
+
+# Longitudinal Course (Change Scores)
+# Adjusting Delta scores for Baseline Age, Sex, and Scanner
+mm_fit_long <- "poly(chronological_age_baseline, 2) + sex + scanner"
+mm_corr_plot_long <- mm_clinical_delta_data %>%
+  mutate(
+    d_bag_res  = residuals(lm(as.formula(paste("delta_bag ~", mm_fit_long)), data = ., na.action = na.exclude)),
+    d_hamd_res = residuals(lm(as.formula(paste("delta_hamd ~", mm_fit_long)), data = ., na.action = na.exclude)),
+    d_bdi_res  = residuals(lm(as.formula(paste("delta_bdi ~", mm_fit_long)), data = ., na.action = na.exclude))
+  )
+bd_fit_long <- "poly(chronological_age_baseline, 2) + sex + tiv"
+bd_corr_plot_long <- bd_clinical_delta_data %>%
+  mutate(
+    d_bag_res  = residuals(lm(as.formula(paste("delta_bag ~", bd_fit_long)), data = ., na.action = na.exclude)),
+    d_cesd_res = residuals(lm(as.formula(paste("delta_cesd ~", bd_fit_long)), data = ., na.action = na.exclude))
+  )
+
+# Theme setup
+thm <- theme_classic(base_size = 12) + 
+       theme(plot.title = element_text(face = "bold", size = 14))
+
+# Panel A1: HAMD State
+p_a1 <- ggplot(mm_corr_plot_cross, aes(x = hamd_res, y = bag_res)) +
+  ylim(-10, 10) +
+  geom_point(alpha = 0.4, color = "#2C3E50") +
+  geom_smooth(method = "lm", color = "#E74C3C", fill = "#E74C3C", alpha = 0.2) +
+  labs(title = "Cross-Sectional State", x = "HAMD-17 (Adjusted)", y = "BAG (Adjusted)") + thm
+
+# Panel A2: BDI State
+p_a2 <- ggplot(mm_corr_plot_cross, aes(x = bdi_res, y = bag_res)) +
+  ylim(-10, 10) +
+  geom_point(alpha = 0.4, color = "#2C3E50") +
+  geom_smooth(method = "lm", color = "#E74C3C", fill = "#E74C3C", alpha = 0.2) +
+  labs(title = "Cross-Sectional State", x = "BDI (Adjusted)", y = "BAG (Adjusted)") + thm
+
+# Panel B1: HAMD Change
+p_b1 <- ggplot(mm_corr_plot_long, aes(x = d_hamd_res, y = d_bag_res)) +
+  ylim(-10, 10) +
+  geom_point(alpha = 0.4, color = "#2C3E50") +
+  geom_smooth(method = "lm", color = "#3498DB", fill = "#3498DB", alpha = 0.2) +
+  labs(title = "Longitudinal Course", x = "\u0394HAMD-17 (Adjusted)", y = "\u0394BAG (Adjusted)") + thm
+
+# Panel B2: BDI Change
+p_b2 <- ggplot(mm_corr_plot_long, aes(x = d_bdi_res, y = d_bag_res)) +
+  ylim(-10, 10) +
+  geom_point(alpha = 0.4, color = "#2C3E50") +
+  geom_smooth(method = "lm", color = "#3498DB", fill = "#3498DB", alpha = 0.2) +
+  labs(title = "Longitudinal Course", x = "\u0394BDI (Adjusted)", y = "\u0394BAG (Adjusted)") + thm
+
+# Panel C1: CESD State
+p_c1 <- ggplot(bd_corr_plot_cross, aes(x = cesd_res, y = bag_res)) +
+  ylim(-10, 10) +
+  geom_point(alpha = 0.4, color = "#2C3E50") +
+  geom_smooth(method = "lm", color = "#009E73", fill = "#009E73", alpha = 0.2) +
+  labs(title = "Cross-Sectional State", x = "CES-D (Adjusted)", y = "BAG (Adjusted)") + thm
+
+# Panel C2: CESD Change
+p_c2 <- ggplot(bd_corr_plot_long, aes(x = d_cesd_res, y = d_bag_res)) +
+  ylim(-10, 10) +
+  geom_point(alpha = 0.4, color = "#2C3E50") +
+  geom_smooth(method = "lm", color = "#009E73", fill = "#009E73", alpha = 0.2) +
+  labs(title = "Longitudinal Course", x = "\u0394CES-D (Adjusted)", y = "\u0394BAG (Adjusted)") + thm
+
+state_marker_plot <- (p_a1 + p_b1) / (p_a2 + p_b2) + (p_c1 + p_c2) +
+  plot_annotation(tag_levels = 'A', tag_prefix = '(', tag_suffix = ')')
+
+print(state_marker_plot)
+ggsave("Analysis_2_Scatter.png", state_marker_plot, width = 9, height = 7.5)
+```
+
+# scar effect
+## MACS + MNC
+### duration
+```{r}
+# Linear Mixed Model for Cumulative Duration
+scar_model_duration <- lmer(
+    BAG ~ duration_episodes_depr + poly(chronological_age, 2) + sex + scale(tiv) + (1 | subject_id) + (1 | scanner), 
+    data = mnc_macs_longitudinal %>% filter(group %in% c("CON", "MDD"))
+)
+summary(scar_model_duration)
+confint(scar_model_duration)
+print(eta_squared(scar_model_duration, partial = TRUE))
+
+stats_table <- coef(summary(scar_model_duration))
+t_duration <- stats_table["duration_episodes_depr", "t value"]
+df_duration <- stats_table["duration_episodes_depr", "df"]
+
+scar_model_duration_partial_r <- t_to_r(t = t_duration, df_error = df_duration)
+print(scar_model_duration_partial_r, digits = 4)
+```
+
+```{r}
+scar_model_duration_unadjusted <- lmer(
+    BAG ~ duration_episodes_depr + poly(chronological_age, 2) + (1 | subject_id) + (1 | scanner),
+    data = mnc_macs_longitudinal %>% filter(group %in% c("CON", "MDD"))
+)
+summary(scar_model_duration_unadjusted)
+confint(scar_model_duration_unadjusted)
+```
+
+```{r}
+# Run TOST using the summary statistics engine
+tost_duration <- corsum_test(
+    r           = scar_model_duration_partial_r$r,
+    n           = df_duration + 1, # Effective sample size
+    alternative = "equivalence",
+    null        = 0.10,
+    method      = "pearson"
+)
+print("=== TOST: Main Effect of Cumulative Duration ===")
+print(tost_duration)
+```
+
+```{r}
+# Testing interaction term
+scar_model_duration_interaction <- lmer(
+    BAG ~ duration_episodes_depr * assessment_exact + poly(chronological_age, 2) + sex + scale(tiv) + (1 | subject_id) + (1 | scanner), 
+    data = mnc_macs_longitudinal %>% filter(group %in% c("CON", "MDD"))
+)
+summary(scar_model_duration_interaction)
+
+stats_table <- coef(summary(scar_model_duration_interaction))
+t_duration_interaction  <- stats_table["duration_episodes_depr:assessment_exact", "t value"]
+df_duration_interaction <- stats_table["duration_episodes_depr:assessment_exact", "df"]
+
+scar_model_duration_interaction_partial_r <- t_to_r(t = t_duration_interaction, df_error = df_duration_interaction)
+print(scar_model_duration_interaction_partial_r, digits = 4)
+```
+
+```{r}
+# Run TOST
+tost_interaction <- corsum_test(
+    r           = scar_model_duration_interaction_partial_r$r,
+    n           = df_duration_interaction + 1,
+    alternative = "equivalence",
+    null        = 0.10,
+    method      = "pearson"
+)
+print("=== TOST: Interaction (Duration x Time) ===")
+print(tost_interaction)
+```
+
+### recurrence
+```{r}
+# Comparing Single vs. Recurrent episodes
+scar_model_recurrent <- lmer(
+    BAG ~ recurrence + poly(chronological_age, 2) + sex + scale(tiv) + (1 | subject_id) + (1 | scanner),
+    data = mnc_macs_longitudinal %>% filter(!is.na(recurrence), group %in% c("CON", "MDD"))
+)
+# summary(scar_model_recurrent)
+scar_anova_recurrent <- anova(scar_model_recurrent, type = "III")
+scar_anova_recurrent
+eta_squared(scar_anova_recurrent)
+
+# Post-hoc comparison
+scar_emm <- emmeans(scar_model_recurrent, pairwise ~ recurrence, lmer.df = "satterthwaite")
+confint(scar_emm)
+```
+
+```{r}
+scar_model_recurrent_unadjusted <- lmer(
+    BAG ~ recurrence + poly(chronological_age, 2) + (1 | subject_id) + (1 | scanner),
+    data = mnc_macs_longitudinal %>% filter(!is.na(recurrence), group %in% c("CON", "MDD"))
+)
+# summary(scar_model_recurrent_unadjusted)
+scar_anova_recurrent <- anova(scar_model_recurrent_unadjusted, type = "III")
+scar_anova_recurrent
+```
+
+```{r}
+scar_recurring_contrasts_df <- as.data.frame(scar_emm$contrasts)
+
+tost_recurrence_group_nrec <- tsum_TOST(
+    m1           = scar_recurring_contrasts_df$estimate[1],
+    sd1          = scar_recurring_contrasts_df$SE[1] * sqrt(scar_recurring_contrasts_df$df[1] + 1),
+    n1           = scar_recurring_contrasts_df$df[1] + 1,
+    low_eqbound  = -0.20,                   # Cohen's d threshold for a "small" effect
+    high_eqbound = 0.20,
+    eqbound_type = "SMD",                   # Standardized Mean Difference
+    hypothesis   = "EQU"
+)
+print("=== Standardized TOST: Non-Recurring vs. Recurring ===")
+print(tost_recurrence_group_nrec)
+
+tost_recurrence_group_hc <- tsum_TOST(
+    m1           = scar_recurring_contrasts_df$estimate[2],
+    sd1          = scar_recurring_contrasts_df$SE[2] * sqrt(scar_recurring_contrasts_df$df[2] + 1),
+    n1           = scar_recurring_contrasts_df$df[2] + 1,
+    low_eqbound  = -0.20,                   # Cohen's d threshold for a "small" effect
+    high_eqbound = 0.20,
+    eqbound_type = "SMD",                   # Standardized Mean Difference
+    hypothesis   = "EQU"
+)
+print("=== Standardized TOST: Non-Recurring vs. Healthy ===")
+print(tost_recurrence_group_hc)
+```
+
+```{r}
+# Recurrent episodes with interaction
+scar_model_recurrent_interaction <- lmer(
+    BAG ~ recurrence * assessment_exact + poly(chronological_age, 2) + sex + scale(tiv) + (1 | subject_id) + (1 | scanner),
+    data = mnc_macs_longitudinal %>% filter(!is.na(recurrence), group %in% c("CON", "MDD"))
+)
+scar_model_recurrent_interaction_summary <- summary(scar_model_recurrent_interaction)
+print(scar_model_recurrent_interaction_summary)
+
+# Extract parameters from your interaction model
+interaction_coef <- coef(scar_model_recurrent_interaction_summary)["recurrenceRecurring:assessment_exact", ]
+t_interaction_rec <- interaction_coef["t value"]
+df_interaction_rec <- interaction_coef["df"]
+
+# Convert to directional partial correlation
+r_interaction_rec <- t_to_r(t = t_interaction_rec, df_error = df_interaction_rec)
+
+# Run standardized TOST (boundary: r = 0.10)
+tost_interaction_rec <- corsum_test(
+    r           = r_interaction_rec$r,
+    n           = df_interaction_rec + 1,
+    alternative = "equivalence",
+    null        = 0.10,
+    method      = "pearson"
+)
+print("=== Standardized TOST: Recurrence x Time Interaction ===")
+print(tost_interaction_rec)
+```
+
+```{r}
+tidy(scar_model_duration_interaction,  effects = "fixed", conf.int = TRUE)   # duration:time row
+tidy(scar_model_recurrent_interaction, effects = "fixed", conf.int = TRUE)   # recurrence:time row
+```
+
+```{r}
+# --- PANEL A: DURATION (Continuous) ---
+duration_plot_df <- mnc_macs_longitudinal %>%
+  filter(group %in% c("MDD", "CON")) %>%
+  mutate(
+    bag_res = residuals(lm(as.formula(paste("BAG ~", "poly(chronological_age, 2) + sex + scanner")), data = ., na.action = na.exclude)),
+    bag_res_lmer = residuals(scar_model_duration),
+    duration_res = residuals(lm(as.formula(paste("duration_episodes_depr ~", "poly(chronological_age, 2) + sex + scanner")), data = ., na.action = na.exclude)),
+    duration_res_lmer = residuals(lmer(
+        duration_episodes_depr ~ poly(chronological_age, 2) + sex + scale(tiv) + 
+        (1 | subject_id) + (1 | scanner),
+        data = mnc_macs_longitudinal %>% filter(group %in% c("CON", "MDD"))
+    ))
+  )
+
+p_scar_a <- ggplot(duration_plot_df, aes(x = duration_res_lmer, y = bag_res_lmer, color = group)) +
+  geom_point(alpha = 0.1, color = "grey50") +
+  geom_smooth(method = "lm", color = "black", fill = NA, alpha = 0.2) +
+  labs(title = "", x = "Cumulative Episode Duration Residuals", y = "BAG Residuals") +
+  theme_classic()
+
+# --- PANEL B: RECURRENCE (Categorical) ---
+recurrence_plot_df <- mnc_macs_longitudinal %>%
+  filter(group %in% c("MDD", "CON"), !is.na(recurrence)) %>%
+  mutate(
+    bag_res = residuals(lm(as.formula(paste("BAG ~", "poly(chronological_age, 2) + sex + scanner")), data = ., na.action = na.exclude)),
+    bag_res_lmer = residuals(scar_model_recurrent)
+  )
+
+p_scar_b <- ggplot(recurrence_plot_df, aes(x = recurrence, y = bag_res_lmer, color = recurrence)) +
+    geom_boxplot(width = 0.2, outlier.shape = NA, alpha = 0.5) +
+    # geom_violin(alpha = 0.2, color = NA) +
+    scale_color_manual(values = c("black", "black", "black")) +
+    geom_jitter(alpha = 0.1, width = 0.15, color = "grey50") +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "black", alpha = 0.5) +
+    scale_fill_manual(values = c("black", "black", "black"))+
+    labs(title = "", x = "Depression Recurrence", y = "BAG Residuals") +
+    theme_classic() + theme(legend.position = "none")
+
+scar_plot <- p_scar_a + p_scar_b + 
+  plot_layout(ncol = 2, guides = "collect") + 
+  plot_annotation(
+    tag_levels = 'A', 
+    tag_prefix = '(', 
+    tag_suffix = ')'
+  ) &
+  theme(
+    plot.tag = element_text(face = "bold", size = 14), # Styles your (A) and (B)
+    plot.tag.position = c(0, 1)                        # Forces tags to very top-left
+  )
+print(scar_plot)
+ggsave("Analysis_3_Scar.png", scar_plot, width = 6, height = 4)
+```
+
+```{r}
+# --- RECURRENCE (Categorical) ---
+recurrence_plot_df <- mnc_macs_longitudinal %>%
+  filter(group %in% c("MDD", "CON"), !is.na(recurrence)) %>%
+  mutate(
+    bag_res = residuals(lm(as.formula(paste("BAG ~", "poly(chronological_age, 2) + sex + scanner")), data = ., na.action = na.exclude)),
+    bag_res_lmer = residuals(scar_model_recurrent),
+    recurrence = factor(recurrence, levels = c("Healthy", "Non-recurring", "Recurring"))
+  )
+p_scar_recurrence <- ggplot(recurrence_plot_df, aes(x = recurrence, y = bag_res_lmer, color = recurrence)) +
+    geom_boxplot(width = 0.2, outlier.shape = NA, alpha = 0.5) +
+    # geom_violin(alpha = 0.2, color = NA) +
+    scale_color_manual(values = c("black", "black", "black")) +
+    geom_jitter(alpha = 0.1, width = 0.15, color = "grey50") +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "black", alpha = 0.5) +
+    scale_fill_manual(values = c("black", "black", "black"))+
+    labs(title = "", x = "Depression Recurrence", y = "BAG") +
+    theme_classic() + theme(legend.position = "none")
+
+print(p_scar_recurrence)
+ggsave("Analysis_3_Scar_recurrence.png", p_scar_recurrence, width = 4, height = 3)
+```
+
+```{r}
+```
+
+```{r}
+# Medication Model (Clinical group only)
+med_model <- lmer(
+    BAG ~ medindex + poly(chronological_age, 2) + sex + scale(tiv) + (1 | subject_id) + (1 | scanner),
+    data = mnc_macs_longitudinal %>% filter(group %in% c("CON", "MDD"), !is.na(medindex))
+)
+
+summary(med_model)
+```
+
+```{r}
+# SUPPLEMETARY RESULT - UNMATCHED CLINICAL SEVERITY
+
+supp_analysis_pre_matching_baseline_dataset <- unmatched_dataset %>%
+    mutate(cohort = case_when(
+        cohort == "bidirect" ~ "Replication",
+        TRUE ~ "Discovery"
+    )) %>%
+    filter(!is.na(chronological_age), !is.na(brain_age), !is.na(sex), assessment_exact == 0) %>%
+    select(cohort, group, chronological_age, sex, HAMD17, bdi, cesd)
+
+message("HAMD")
+supp_analysis_mm_hamd_model <- lm(
+    HAMD17 ~ group + sex + poly(chronological_age, 2),
+    data = supp_analysis_pre_matching_baseline_dataset
+)
+supp_analysis_mm_hamd_anova <- Anova(supp_analysis_mm_hamd_model, type = "III")
+print(supp_analysis_mm_hamd_anova)
+emmeans(supp_analysis_mm_hamd_model, pairwise ~ group, adjust = "tukey")
+
+message("BDI")
+supp_analysis_mm_bdi_model <- lm(
+    bdi ~ group + sex + poly(chronological_age, 2),
+    data = supp_analysis_pre_matching_baseline_dataset
+)
+supp_analysis_mm_bdi_anova <- Anova(supp_analysis_mm_bdi_model, type = "III")
+print(supp_analysis_mm_bdi_anova)
+emmeans(supp_analysis_mm_bdi_model, pairwise ~ group, adjust = "tukey")
+
+message("CESD")
+supp_analysis_mm_cesd_model <- lm(
+    cesd ~ group + sex + poly(chronological_age, 2),
+    data = supp_analysis_pre_matching_baseline_dataset
+)
+supp_analysis_mm_cesd_anova <- Anova(supp_analysis_mm_cesd_model, type = "III")
+print(supp_analysis_mm_cesd_anova)
+emmeans(supp_analysis_mm_cesd_model, pairwise ~ group, adjust = "tukey")
+```

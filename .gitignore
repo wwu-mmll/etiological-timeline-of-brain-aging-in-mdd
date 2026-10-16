@@ -1,0 +1,11 @@
+data/**/*.csv
+
+output/
+
+config.yml
+
+/*.png
+
+.vscode/
+
+!*/.gitkeep

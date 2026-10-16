@@ -1,0 +1,2 @@
+default:
+  project_data_path: "/path/to/shared/project/data"

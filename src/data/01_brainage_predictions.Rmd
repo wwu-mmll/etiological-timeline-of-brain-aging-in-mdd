@@ -1,0 +1,105 @@
+---
+title: "Brainage Prediction"
+
+output: pdf_document
+---
+
+```{r setup, include = TRUE}
+library(tidyverse)
+library(here)
+library(janitor)
+library(glue)
+library(fs)
+knitr::opts_chunk$set(echo = TRUE)
+conf <- config::get()
+```
+
+```{r split-by-cohort}
+all_study_mris <- read.csv(here("data/raw", "mris_for_converter_analysis.csv"))
+```
+
+For brainage prediction using brainageR we used the script:
+`./scripts/brainageR_predictions.sh -c data/tmp/study_index_files/{COHORT}.csv -o /{project_root}/brainageR_predictions`
+
+```{r load-data}
+existing_mris_data <- read.csv(here("data/raw", "mris_for_converter_analysis.csv"))
+
+brainager_predictions_path <- file.path(conf$project_data_path, "brainageR_predictions")
+tissue_volume_csvs <- dir_ls(brainager_predictions_path, recurse = TRUE, glob = "*_tissue_volumes.csv")
+brainage_prediction_csvs <- dir_ls(brainager_predictions_path, recurse = TRUE, glob = "*_brainage.csv")
+```
+
+```{r transform-brainage-data}
+brainage_prediction_cache_path <- here("data/tmp", "brainage_predictions.csv")
+
+if (file.exists(brainage_prediction_cache_path)) {
+    # --- Load Cached Data ---
+    message("Found cached data. Loading from: ", brainage_prediction_cache_path)
+    brainage_predictions <- read_csv(brainage_prediction_cache_path, col_types = cols())
+    
+} else {
+    brainage_predictions <- brainage_prediction_csvs %>% 
+        set_names() %>% 
+        map_df(~read_csv(.x, col_types = cols()), .id = "file_path") %>%
+        mutate(composite_key = str_extract(file_path, glue("(?<={brainager_predictions_path}/)[^/]+"))) %>%
+        separate_wider_delim(
+            cols = composite_key,
+            delim = "_",
+            names = c("cohort", "assessment", "subject_id"),
+            too_many = "merge"
+        ) %>%
+        mutate(
+            assessment = as.integer(assessment),
+            subject_id = if_else(cohort == "macs", str_pad(subject_id, width = 4, side = "left", pad = "0"), subject_id)
+        ) %>%
+        select(-file_path, -File)
+
+    if (!dir.exists(here("data/tmp"))) dir.create(here("data/tmp"))
+    write_csv(brainage_predictions, brainage_prediction_cache_path)
+}
+
+```
+```{r transform-tissue-data}
+tissue_cache_path <- here("data/tmp", "tissue_volumes.csv")
+
+if (file.exists(tissue_cache_path)) {
+    # --- Load Cached Data ---
+    message("Found cached data. Loading from: ", tissue_cache_path)
+    tissue_volumes <- read_csv(tissue_cache_path, col_types = cols())
+    
+} else {
+    tissue_volumes <- tissue_volume_csvs %>% 
+        set_names() %>% 
+        map_df(~read_csv(.x, col_types = cols()), .id = "file_path") %>%
+        mutate(composite_key = str_extract(file_path, glue("(?<={brainager_predictions_path}/)[^/]+"))) %>%
+        separate_wider_delim(
+            cols = composite_key,
+            delim = "_",
+            names = c("cohort", "assessment", "subject_id"),
+            too_many = "merge"
+        ) %>%
+        mutate(
+            assessment = as.integer(assessment),
+            subject_id = if_else(cohort == "macs", str_pad(subject_id, width = 4, side = "left", pad = "0"), subject_id)
+        ) %>%
+        # Total Gray Matter volume, Total White Matter volume, Total CSF volume
+        rename(gmv = Volume1, wmv = Volume2, csf = Volume3) %>%
+        select(-file_path, -File)
+
+    # Create tmp directory if it doesn't exist
+    if (!dir.exists(here("data/tmp"))) dir.create(here("data/tmp"))
+    
+    # write to cache dir
+    write_csv(tissue_volumes, tissue_cache_path)
+}
+
+colnames(tissue_volumes)
+```
+
+```{r merge-data}
+merged_df <- existing_mris_data %>%
+  left_join(brainage_predictions, by = c("cohort", "assessment", "subject_id")) %>%
+  left_join(tissue_volumes, by = c("cohort", "assessment", "subject_id")) %>% 
+  select(cohort, subject_id, assessment, everything(), -file_name, -image_path)
+write.csv(merged_df, file=here("data/processed/brainage_for_analysis.csv"), row.names = FALSE)
+```

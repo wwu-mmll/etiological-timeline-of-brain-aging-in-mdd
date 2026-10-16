@@ -1,0 +1,107 @@
+
+```{r setup, include = TRUE}
+library(tidyverse)
+library(here)
+library(ggplot2)
+library(patchwork)
+library(emmeans)
+library(lme4)
+
+knitr::opts_chunk$set(echo = TRUE)
+conf <- config::get()
+```
+
+```{r}
+matched_dataset <- read.csv(here("data/processed/converter_dataset_matched.csv")) %>%
+                      mutate(
+                        sex = as.factor(sex),
+                        scanner = as.factor(scanner),
+                        group = as.factor(group),
+                        site = as.factor(case_when(
+                            str_starts(scanner, "macs_mr") ~ "macs_mr",
+                            scanner == "macs_ms" ~ "macs_ms",
+                            scanner == "bidirect" ~ "bd_ms",
+                            scanner == "mnc_old_philips" ~ "mnc",
+                            TRUE ~ NA_character_
+                        ))
+                      )
+
+unmatched_dataset <- read.csv(here("data/processed/converter_dataset_trimmed_con.csv")) %>%
+                      filter(
+                        !is.na(brain_age),
+                        !is.na(sex),
+                        (scanner %in% matched_dataset$scanner)
+                      ) %>%
+                      mutate(
+                        sex = as.factor(sex),
+                        scanner = as.factor(scanner),
+                        group = as.factor(group),
+                        site = as.factor(case_when(
+                            str_starts(scanner, "macs_mr") ~ "macs_mr",
+                            scanner == "macs_ms" ~ "macs_ms",
+                            scanner == "bidirect" ~ "bd_ms",
+                            scanner == "mnc_old_philips" ~ "mnc",
+                            TRUE ~ NA_character_
+                        ))
+                      )
+
+unmatched_hc_data <- unmatched_dataset %>%
+                      filter(
+                        group == "HC" &
+                        !is.na(chronological_age) &
+                        !(subject_id %in% (matched_dataset %>% pull(subject_id)))
+                      )
+
+correct_age_bias <- function(.data, healthy_reference) {
+  bias_model <- lm(
+    BAG ~ poly(chronological_age, 2),
+    data = healthy_reference
+  )
+
+  corrected_dataset <- .data %>%
+    mutate(
+      expected_bias = predict(bias_model, newdata = {{.data}}),
+      BAG_corrected = BAG - expected_bias
+    ) %>%
+    select(-expected_bias)
+
+    return (corrected_dataset)
+}
+
+print_mae <- function(.data) {
+  mae <- .data %>%
+    summarise(
+      mae_raw = mean(abs(BAG), na.rm = TRUE),
+      mae_corrected = mean(abs(BAG_corrected), na.rm = TRUE)
+    )
+  print(mae)
+}
+```
+
+```{r}
+corrected_mnc_macs <- correct_age_bias(
+  (matched_dataset %>% filter(cohort %in% c('macs', 'mnc'))),
+  (unmatched_hc_data %>% filter(cohort %in% c('macs', 'mnc')))
+)
+```
+```{r}
+corrected_bidirect <- correct_age_bias(
+  (matched_dataset %>% filter(cohort == "bidirect")),
+  (unmatched_hc_data %>% filter(cohort == "bidirect"))
+)
+```
+
+```{r}
+cat("MAE mnc+macs\n")
+corrected_mnc_macs %>% filter(group == "HC") %>% print_mae()
+cat("MAE bidirect\n")
+corrected_bidirect %>% filter(group == "HC") %>% print_mae()
+```
+
+```{r}
+write.table(bind_rows(corrected_mnc_macs, corrected_bidirect),
+            file = here("data/processed/converter_dataset_matched_corrected.csv"),
+            sep = ",", quote = FALSE,
+            row.names = FALSE
+)
+```

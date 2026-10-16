@@ -1,0 +1,358 @@
+---
+title: "Data Import"
+author: "Max"
+
+output: html_document
+---
+
+```{r setup, include = TRUE}
+library(tidyverse)
+library(here)
+library(tableone)
+library(ggplot2)
+library(lsr)
+library(MatchIt)
+library(cobalt)
+library(patchwork)
+
+knitr::opts_chunk$set(echo = TRUE)
+conf <- config::get()
+```
+
+```{r}
+unmatched_dataset <- read.csv(here("data/processed/converter_dataset_trimmed_con.csv")) %>%
+                      mutate(
+                        # sex = as.factor(sex),
+                        scanner = as.factor(scanner),
+                        site = as.factor(case_when(
+                          scanner == "bidirect" ~ "bd_ms",
+                          scanner == "mnc_old_philips" ~ "mnc_ms",
+                          scanner == "macs_ms" ~ "macs_ms",
+                          str_starts(scanner, "macs_mr") ~ "macs_mr",
+                          TRUE ~ NA_character_
+                        )),
+                        group = as.factor(group)
+                      ) %>%
+                      filter(!is.na(brain_age), !is.na(chronological_age)) #, !is.na(sex)) with  !is.na(sex) is currently in the manuscript
+
+baseline_dataset <- unmatched_dataset %>%
+  group_by(subject_id) %>%
+  filter(assessment == min(assessment)) %>%
+  ungroup()
+```
+
+# Before matching
+```{r}
+ggplot(baseline_dataset, aes(x = chronological_age, fill = group)) +
+  geom_density(alpha = 0.4) +
+  theme_minimal() +
+  labs(
+    title = "Age Distribution Imbalance",
+    subtitle = "Clear shifts in density indicate the need for matching",
+    x = "Age (Years)", y = "Density"
+  )
+```
+
+```{r}
+ggplot(baseline_dataset, aes(x = chronological_age, y = BAG, color = group)) +
+  geom_point(alpha = 0.6) +
+  geom_smooth(method = "lm", formula = y ~ poly(x, 3)) +
+  theme_minimal() +
+  labs(
+    title = "The Confounding Effect of Age on BAG",
+    x = "Chronological Age", y = "Brain Age Gap (BAG)"
+  )
+```
+
+# Create a table showing the standardized differences
+```{r}
+get_difference_p <- function(.data) {  
+  # Global check: Is age distribution independent of group?
+  age_stats <- kruskal.test(chronological_age ~ group, data = .data)
+  print(age_stats)
+
+  # Global check: Is sex distribution independent of group?
+  sex_table <- table(.data$group, .data$sex)
+  sex_stats <- chisq.test(sex_table)
+  print(sex_stats)
+
+  if (length(unique(.data$site)) > 1) {
+    # Global check: Is site (basically scanner) distribution independent of group?
+    site_table <- table(.data$group, droplevels(.data$site))
+    site_stats <- chisq.test(site_table)
+    print(site_stats)
+  }
+}
+
+# Function to get SMD for Age specifically against the CON group
+get_age_smd <- function(.data, g1, g2) {
+  df_sub <- .data %>% filter(group %in% c(g1, g2)) %>% droplevels()
+  d <- cohensD(chronological_age ~ group, data = df_sub)
+  return(round(d, 3))
+}
+```
+
+```{r}
+baseline_dataset %>% get_difference_p()
+```
+
+# Age Sex Matching
+## MNC
+```{r}
+unmatched_mnc_data <- bind_rows(
+    unmatched_dataset %>%
+      filter(cohort == "mnc", group != "CON") %>%
+      group_by(subject_id) %>%
+      filter(any(assessment == 0)) %>%
+      slice_min(order_by = assessment, n = 2, with_ties = FALSE) %>%
+      ungroup(),
+    unmatched_dataset %>% filter(cohort == "mnc", group == "CON")
+) %>% filter(!is.na(sex))
+```
+
+## macs
+```{r}
+unmatched_macs_data <- unmatched_dataset %>% filter(cohort == "macs")
+```
+
+## bidirect
+```{r}
+unmatched_bidirect_data <- bind_rows(
+    unmatched_dataset %>%
+      filter(cohort == "bidirect", group != "CON") %>%
+      group_by(subject_id) %>%
+      filter(any(assessment == 0)) %>%
+      slice_min(order_by = assessment, n = 2, with_ties = FALSE) %>%
+      ungroup(),
+    unmatched_dataset %>% filter(cohort == "bidirect", group == "CON")
+)
+```
+
+```{r}
+print_scan_counts <- function(.data) {
+  print(
+    .data %>%
+      group_by(group) %>%
+      summarise(
+        n_subjects = n_distinct(subject_id),
+        n_scans = n()
+      )
+  )
+}
+
+prepare_dataset <- function(.data) {
+  tmp <- .data %>%
+    mutate(
+      is_con = if_else(group == "CON", 1, 0) # MatchIt likes a binary 0/1 indicator
+    )
+
+  subjects_with_long_followup <- tmp %>%
+    filter(group %in% c("HC", "MDD"), assessment_exact > 4) %>%
+    pull(subject_id) %>%
+    unique()
+
+  # tmp <- tmp %>% filter(!(subject_id %in% subjects_with_long_followup))
+  return(tmp)
+}
+cat("preparing MNC")
+prepared_unmatched_mnc_data <- unmatched_mnc_data %>% prepare_dataset()
+print_scan_counts(prepared_unmatched_mnc_data)
+
+cat("preparing MACS")
+prepared_unmatched_macs_data <- unmatched_macs_data %>% prepare_dataset()
+print_scan_counts(prepared_unmatched_macs_data)
+
+cat("preparing BiDirect")
+prepared_unmatched_bidirect_data <- unmatched_bidirect_data %>% prepare_dataset()
+print_scan_counts(prepared_unmatched_bidirect_data)
+```
+
+```{r}
+perform_matching <- function(.data) {
+  baseline_data <- .data %>% filter(assessment_exact == 0, !is.na(chronological_age), !is.na(sex))
+
+  predictors <- c("chronological_age", "sex")
+  if (length(unique(baseline_data$site)) > 1) {
+    predictors <- c(predictors, "site")
+  }
+  matching_formula <- reformulate(termlabels = predictors, response = "is_con")
+
+  # Match HC vs CON
+  match_hc <- matchit(
+    matching_formula,
+    data = baseline_data %>% filter(group %in% c("CON", "HC")),
+    method = "nearest",
+    distance = "glm",
+    ratio = 5,
+    replace = FALSE
+  )
+  print(match_hc)
+
+  # Match MDD vs CON
+  match_mdd <- matchit(
+    as.formula(matching_formula),
+    data = baseline_data %>% filter(group %in% c("CON", "MDD")),
+    method = "nearest",
+    distance = "glm",
+    ratio = 5,
+    replace = FALSE
+  )
+
+  matched_ids <- unique(c(
+    match.data(match_hc)$subject_id,
+    match.data(match_mdd)$subject_id
+  ))
+
+  # 4. Filter your longitudinal 'pruned_data' using these IDs
+  matched_longitudinal_data <- .data %>%
+    filter(subject_id %in% matched_ids) %>%
+    group_by(subject_id) %>%
+    arrange(date_mri, .by_group = TRUE) %>%
+    mutate(
+      assessment_exact = time_length(
+          interval(first(date_mri), date_mri), 
+          unit = "year"
+      )
+    ) %>%
+    ungroup() %>%
+    arrange(cohort, subject_id, date_mri)
+  
+  return(matched_longitudinal_data)
+}
+```
+
+```{r}
+prepared_unmatched_mnc_macs_data <- bind_rows(
+  prepared_unmatched_macs_data, prepared_unmatched_mnc_data
+)
+prepared_unmatched_mnc_macs_data %>% filter(assessment_exact == 0) %>% get_difference_p()
+matched_mnc_macs <- perform_matching(prepared_unmatched_mnc_macs_data)
+matched_mnc_macs %>% print_scan_counts()
+matched_mnc_macs %>% filter(assessment_exact == 0) %>% get_difference_p()
+```
+
+```{r}
+prepared_unmatched_bidirect_data %>% filter(assessment_exact == 0) %>% get_difference_p()
+matched_bidirect <- perform_matching(prepared_unmatched_bidirect_data)
+matched_bidirect %>% print_scan_counts()
+matched_bidirect %>% filter(assessment_exact == 0) %>% get_difference_p()
+```
+
+```{r}
+# matched_longitudinal_dataset <- bind_rows(matched_mnc, matched_macs, matched_bidirect)
+matched_longitudinal_dataset <- bind_rows(matched_mnc_macs, matched_bidirect)
+```
+
+```{r}
+# Checking mean age for equivalence
+matched_longitudinal_dataset %>%
+  filter(assessment_exact == 0) %>% # Look at baseline only
+  group_by(group) %>%
+  summarise(mean_age = mean(chronological_age), sd_age = sd(chronological_age))
+```
+```{r}
+ggplot((matched_longitudinal_dataset %>% filter(assessment_exact == 0)), aes(x = chronological_age, fill = group)) +
+  geom_density(alpha = 0.4) +
+  theme_minimal() +
+  labs(
+    title = "Age Distribution Imbalance",
+    x = "Age (Years)", y = "Density"
+  )
+```
+
+```{r}
+ggplot(matched_longitudinal_dataset, aes(x = chronological_age, y = BAG, color = group)) +
+  geom_point(alpha = 0.6) +
+  geom_smooth(method = "lm", formula = y ~ poly(x, 2)) +
+  theme_minimal() +
+  labs(
+    title = "The Confounding Effect of Age on BAG",
+    x = "Chronological Age", y = "Brain Age Gap (BAG)"
+  )
+```
+
+```{r}
+write.table(matched_longitudinal_dataset,
+            file = here("data/processed/converter_dataset_matched.csv"),
+            sep = ",", quote = FALSE,
+            row.names = FALSE
+)
+```
+
+# plots
+```{r}
+pre_macs_mnc_data <- prepared_unmatched_mnc_macs_data %>% filter(assessment_exact == 0)
+matched_macs_mnc_baseline <- matched_mnc_macs %>% filter(assessment_exact == 0)
+
+mm_pre_age <- ggplot(pre_macs_mnc_data, aes(x = chronological_age, fill = group)) +
+  geom_density(alpha = 0.4) +
+  labs(title = "Pre-Matching: Age Distribution", y = "Density", x = "Age", fill = "Group") +
+  theme_classic()
+
+mm_pre_sex <- ggplot(pre_macs_mnc_data, aes(x = group, fill = sex)) +
+  geom_bar(position = "fill") +
+  scale_y_continuous(labels = scales::percent) +
+  labs(title = "Pre-Matching: Sex Distribution", y = "Proportion", x = "Group", fill = "Group") +
+  theme_classic()
+
+mm_pre_site <- ggplot(pre_macs_mnc_data, aes(x = group, fill = site)) +
+  geom_bar(position = "fill") +
+  scale_y_continuous(labels = scales::percent) +
+  labs(title = "Pre-Matching: Site Distribution", y = "Proportion", x = "Group", fill = "Group") +
+  theme_classic()
+
+mm_post_age <- ggplot(matched_macs_mnc_baseline, aes(x = chronological_age, fill = group)) +
+  geom_density(alpha = 0.4) +
+  labs(title = "Post-Matching: Age Distribution", y = "Density", x = "Age", fill = "Group") +
+  theme_classic()
+
+mm_post_sex <- ggplot(matched_macs_mnc_baseline, aes(x = group, fill = sex)) +
+  geom_bar(position = "fill") +
+  scale_y_continuous(labels = scales::percent) +
+  labs(title = "Post-Matching: Sex Distribution", y = "Proportion", x = "Group", fill = "Group") +
+  theme_classic()
+
+mm_post_site <- ggplot(matched_macs_mnc_baseline, aes(x = group, fill = site)) +
+  geom_bar(position = "fill") +
+  scale_y_continuous(labels = scales::percent) +
+  labs(title = "Post-Matching: Site Distribution", y = "Proportion", x = "Group", fill = "Group") +
+  theme_classic()
+
+pre_bid_data <- prepared_unmatched_bidirect_data %>% filter(assessment_exact == 0)
+matched_bidirect_baseline <- matched_bidirect %>% filter(assessment_exact == 0)
+
+bd_pre_age <- ggplot(pre_bid_data, aes(x = chronological_age, fill = group)) +
+  geom_density(alpha = 0.4) +
+  labs(title = "Pre-Matching: Age Distribution", y = "Density", x = "Age", fill = "Group") +
+  theme_classic()
+
+bd_pre_sex <- ggplot(pre_bid_data, aes(x = group, fill = sex)) +
+  geom_bar(position = "fill") +
+  scale_y_continuous(labels = scales::percent) +
+  labs(title = "Pre-Matching: Sex Distribution", y = "Proportion", x = "Group", fill = "Group") +
+  theme_classic()
+
+bd_post_age <- ggplot(matched_bidirect_baseline, aes(x = chronological_age, fill = group)) +
+  geom_density(alpha = 0.4) +
+  labs(title = "Post-Matching: Age Distribution", y = "Density", x = "Age", fill = "Group") +
+  theme_classic()
+
+bd_post_sex <- ggplot(matched_bidirect_baseline, aes(x = group, fill = sex)) +
+  geom_bar(position = "fill") +
+  scale_y_continuous(labels = scales::percent) +
+  labs(title = "Post-Matching: Sex Distribution", y = "Proportion", x = "Group", fill = "Group") +
+  theme_classic()
+
+final_chart <- wrap_elements(mm_pre_age + mm_post_age + plot_layout(guides = "collect") & theme(legend.position = 'right', legend.title = element_blank())) /
+              wrap_elements(mm_pre_sex + mm_post_sex + plot_layout(guides = "collect") & theme(legend.position = 'right', legend.title = element_blank())) /
+              wrap_elements(mm_pre_site + mm_post_site + plot_layout(guides = "collect") & theme(legend.position = 'right', legend.title = element_blank())) /
+              wrap_elements(bd_pre_age + bd_post_age + plot_layout(guides = "collect") & theme(legend.position = 'right', legend.title = element_blank())) /
+              wrap_elements(bd_pre_sex + bd_post_sex + plot_layout(guides = "collect") & theme(legend.position = 'right', legend.title = element_blank())) +
+            plot_annotation(tag_levels = 'A', tag_prefix = '(', tag_suffix = ')')
+
+print(final_chart)
+ggsave("CON_Figure_matching_baseline.png", final_chart, width = 8, height = 11)
+```
+
+```{r}
+```

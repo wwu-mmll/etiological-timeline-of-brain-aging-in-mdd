@@ -1,0 +1,12 @@
+---
+title: "Install Packages"
+---
+
+```{r setup, include = TRUE}
+install.packages(
+    "tidyverse", "here", "janitor", "glue", "fs", "config",
+    "tableone", "lsr", "MatchIt", "cobalt", "patchwork",
+    "emmeans", "lme4", "lmerTest", "gtsummary", "car",
+    "ggeffects", "ggsignif", "effectsize", "TOSTER", "broom.mixed"
+)
+```

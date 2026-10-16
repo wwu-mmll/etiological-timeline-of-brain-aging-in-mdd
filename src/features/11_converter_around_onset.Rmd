@@ -1,0 +1,69 @@
+
+```{r setup, include = TRUE}
+library(tidyverse)
+library(here)
+library(janitor)
+library(glue)
+library(fs)
+library(haven)
+
+knitr::opts_chunk$set(echo = TRUE)
+conf <- config::get()
+```
+
+```{r}
+converter_dataset <- read_csv(here("data/processed/converter_dataset.csv"))
+```
+
+```{r}
+trimmed_con <- converter_dataset %>% filter(group == "CON" & !is.na(onset_date)) %>% group_by(subject_id) %>% filter(
+    # Only the last scan BEFORE onset and first AFTER onset
+    if (any(date_mri <= onset_date, na.rm = TRUE)) {
+        date_mri == max(date_mri[date_mri <= onset_date], na.rm = TRUE)
+    } else {
+        FALSE
+    } |
+    if (any(date_mri > onset_date, na.rm = TRUE)) {
+        date_mri == min(date_mri[date_mri > onset_date], na.rm = TRUE)
+    } else {
+        FALSE
+    }
+) %>% ungroup()
+```
+
+```{r}
+hc_mdd <- converter_dataset %>%
+    filter(
+        group != "CON",
+        !is.na(brain_age)
+    ) %>%
+    mutate(
+        assessment_exact = NULL
+    )
+```
+
+```{r}
+trimmed_converter_dataset <- bind_rows(trimmed_con, hc_mdd) %>%
+    group_by(subject_id) %>%
+    mutate(
+      assessment_exact = time_length(
+          interval(first(date_mri), date_mri), 
+          unit = "year"
+      )
+    ) %>%
+    ungroup() %>%
+    arrange(cohort, subject_id, date_mri) %>%
+    mutate(
+      remission = if_else(group == "CON" & assessment_exact == 0, "Healthy", remission),
+      recurrence = if_else(group == "CON" & assessment_exact == 0, "Healthy", recurrence)
+    )
+
+write.table(trimmed_converter_dataset,
+            file = here("data/processed/converter_dataset_trimmed_con.csv"),
+            sep = ",", quote = FALSE,
+            row.names = FALSE
+)
+```
+
+```{r}
+```

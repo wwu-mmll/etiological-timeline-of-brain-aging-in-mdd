@@ -1,0 +1,5 @@
+cohort;subject_id;assessment;image_path
+abc;123;0;/path/to/mri_123_0.nii
+abc;123;2;/path/to/mri_123_2.nii
+def;456;0;/path/to/mri_456_0.nii
+def;456;2;/path/to/mri_456_2.nii

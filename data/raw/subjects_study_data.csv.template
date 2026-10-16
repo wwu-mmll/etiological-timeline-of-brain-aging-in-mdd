@@ -1,0 +1,4 @@
+"cohort","subject_id","assessment","age","sex","HAMD21","bdi","remission","recurrence","duration_episodes_depr","number_episodes_depr","medindex","med_ad","med_ap","BMI","onset_date","cesd"
+"abc","123",0,20,"f",13,20,0,0,12,1,0,0,0,21.00,"2015-01-01",NA
+"abc","123",2,22,"f",10,15,NA,0,20,1,1,0,0,20.00,"2015-01-01",NA
+"def","456",0,50,"m",0,NA,0,0,0,0,0,0,0,22,"2010-01-01",10

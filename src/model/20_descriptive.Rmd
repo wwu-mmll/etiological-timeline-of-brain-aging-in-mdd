@@ -1,0 +1,251 @@
+
+```{r setup, include = TRUE}
+library(tidyverse)
+library(here)
+library(glue)
+library(lmerTest)
+library(emmeans)
+library(gtsummary)
+library(scales)
+library(patchwork)
+library(tableone)
+knitr::opts_chunk$set(echo = TRUE)
+conf <- config::get()
+```
+
+```{r load-data}
+pre_matching_dataset <- read.csv(here("data/processed/converter_dataset.csv"))
+pre_matching_dataset <- pre_matching_dataset %>% mutate(
+        site = case_when(
+            scanner == "mnc_old_philips" ~ "mnc_ms",
+            scanner == "macs_ms" ~ "macs_ms",
+            str_starts(scanner, "macs_mr") ~ "macs_mr",
+            TRUE ~ NA_character_
+        )
+    )
+pre_matching_baseline_dataset <- pre_matching_dataset %>%
+    group_by(subject_id) %>%
+    slice_min(assessment, n = 1, with_ties = FALSE) %>%
+    ungroup()
+
+brainager_predictions <- read.csv(here("data/processed/converter_dataset_matched_corrected.csv"))
+
+lmer_data <- brainager_predictions %>%
+    filter(!is.na(brain_age), !is.na(assessment_exact)) %>%
+    mutate(
+        scanner = as.factor(scanner),
+        site = as.factor(site),
+        sex = as.factor(sex),
+        tiv = gmv + wmv + csf,
+        BAG = brain_age - chronological_age,
+        group = factor(group, levels = c("HC", "MDD", "CON"), labels = c("HC", "MDD", "CON"))
+    ) %>%
+    select(BAG, BAG_corrected, brain_age, cohort, subject_id, assessment, assessment_exact, group, sex, scanner, site, chronological_age, tiv, HAMD17, bdi, cesd, BMI, medindex, tiv, duration_episodes_depr, recurrence)
+
+baseline_dataset <- lmer_data %>% filter(assessment_exact == 0)
+```
+
+```{r}
+lmer_data %>% filter(assessment != 0) |> ggplot(aes(x = chronological_age, fill = cohort)) +
+    geom_density(position = "identity", alpha = 0.5, color = "white") +
+    theme_minimal() +
+    labs(
+        title = "Age Distribution by Group",
+        x = "Age (Years)",
+        y = "Count",
+        fill = "Group"
+    )
+```
+
+# Brain age Correction
+```{r ggplot}
+# Filter out a baseline HC sample from your main data to check
+check_data <- brainager_predictions %>% filter(group == "HC", assessment_exact == 0)
+
+# Plot 1: Uncorrected (Should show a downward slope)
+p1 <- ggplot(check_data, aes(x = chronological_age, y = BAG)) +
+    geom_point(alpha = 0.5, color = "darkred") +
+    geom_smooth(method = "lm", color = "black") +
+    theme_minimal() +
+    labs(title = "Uncorrected BAG", y = "Raw BAG", x = "Chronological Age")
+
+# Plot 2: Corrected (Should be perfectly flat)
+p2 <- ggplot(check_data, aes(x = chronological_age, y = BAG_corrected)) +
+    geom_point(alpha = 0.5, color = "steelblue") +
+    geom_smooth(method = "lm", color = "black") +
+    theme_minimal() +
+    labs(title = "Bias-Corrected BAG", y = "Corrected BAG", x = "Chronological Age")
+
+# Plot 2: Corrected (Should be perfectly flat)
+# p3 <- ggplot(check_data, aes(x = chronological_age, y = BAG_cohort_corrected)) +
+#     geom_point(alpha = 0.5, color = "green") +
+#     geom_smooth(method = "lm", color = "black") +
+#     theme_minimal() +
+#     labs(title = "Per Cohort Corrected BAG", y = "Cohort-Corrected BAG", x = "Chronological Age")
+
+# Display side-by-side
+p1 + p2 # + p3
+```
+
+```{r}
+ggplot(lmer_data %>% filter(assessment_exact != 0), aes(x = assessment_exact)) +
+    geom_histogram(binwidth = 0.25, fill = "steelblue", color = "white") +
+    theme_minimal() +
+    labs(
+        title = "Distribution of Assessment Timing",
+        x = "Years from Baseline (assessment_exact)",
+        y = "Frequency"
+    )
+```
+
+```{r}
+lmer_data %>% filter(assessment != 0) |> ggplot(aes(x = chronological_age, fill = group)) +
+    # alpha = 0.5 makes the colors semi-transparent so you can see the overlap
+    geom_density(alpha = 0.5) +
+    theme_minimal() +
+    labs(
+        title = "Age Distribution by Group",
+        x = "Age (Years)",
+        y = "Density",
+        fill = "Group"
+    )
+```
+
+```{r}
+    lmer_data %>%
+        group_by(group) %>%
+        mutate(BAG_delta = BAG - first(BAG)) %>%
+        ungroup() %>%
+        ggplot(aes(x = BAG_delta, fill = group)) +
+        geom_density(position = "identity", alpha = 0.5, color = "white") +
+        theme_minimal() +
+        labs(
+            title = "Density of Brain Age Gap Delta by Group",
+            x = "Brain Age Gap Delta (years)",
+            y = "Density",
+            fill = "Group"
+        )
+```
+
+```{r}
+# Are the groups different in age at baseline?
+# Formula: Dependent Variable (age) ~ Independent Variable (group)
+age_anova <- aov(chronological_age ~ group, data = lmer_data %>% filter(assessment == 0))
+
+# normality of residuals
+shapiro_result <- shapiro.test(residuals(age_anova))
+
+if (shapiro_result$p.value > 0.05) {
+    # If normality is not rejected, use ANOVA
+    print("normality assumption met, using ANOVA")
+    anova_result <- summary(age_anova)
+    print(anova_result)
+    if (anova_result[[1]]$`Pr(>F)`[1] < 0.05) {
+        print("The groups are differently distributed in age.")
+    } else {
+        print("The groups are not differently distributed in age.")
+    }
+} else {
+    # If normality is rejected, use Kruskal-Wallis test
+    print("normality assumption not met, using Kruskal-Wallis test")
+    kruskal_result <- kruskal.test(chronological_age ~ group, data = lmer_data %>% filter(assessment == 0))
+    print(kruskal_result)
+    if (kruskal_result$p.value < 0.05) {
+        print("The groups are differently distributed in age.")
+    } else {
+        print("The groups are not differently distributed in age.")
+    }
+}
+```
+
+```{r}
+table1_data <- pre_matching_baseline_dataset %>%
+    mutate(cohort = case_when(
+        cohort == "bidirect" ~ "Replication",
+        TRUE ~ "Discovery"
+    )) %>%
+    filter(!is.na(chronological_age), !is.na(brain_age), !is.na(sex)) %>%
+    select(cohort, group, chronological_age, sex, HAMD17, bdi, cesd)
+
+table1 <- table1_data %>% tbl_strata(
+    strata = cohort,
+    .tbl_fun = ~.x %>%
+        tbl_summary(
+            by = group,                               # Split the table by HC, MDD, CON
+            statistic = list(
+                all_continuous() ~ "{mean} ({sd}), N = {N_nonmiss}",     # Show Mean (SD) and non-missing count for age
+                all_categorical() ~ "{n} ({p}%)"        # Show Count (%) for Sex/Site
+            ),
+            label = list(
+                chronological_age ~ "Age (Years)",
+                sex ~ "Sex"
+            ),
+            missing = "no",
+            digits = list(all_continuous() ~ c(2, 2))
+        ) %>%
+        add_overall(),
+    modify_header(all_stat_cols() ~ "**{level}**")
+  )
+
+# View the table
+table1 # %>% flextable::save_as_docx(path = here("output/sample_description.docx"))
+```
+
+```{r}
+table1_scan_data <- pre_matching_dataset %>%
+    mutate(cohort = case_when(
+        cohort == "bidirect" ~ "Replication",
+        TRUE ~ "Discovery"
+    )) %>%
+    filter(!is.na(chronological_age), !is.na(brain_age), !is.na(sex)) %>%
+    group_by(cohort, subject_id) %>%
+    mutate(n_row = n()) %>%
+    slice_min(assessment, n = 1, with_ties = FALSE) %>%
+    ungroup() %>%
+    group_by(cohort, group) %>%
+    summarise(
+        sum_rows_per_subject = sum(n_row, na.rm = TRUE),
+        mean_rows_per_subject = mean(n_row, na.rm = TRUE),
+        sd_rows_per_subject = sd(n_row, na.rm = TRUE)
+    )
+
+table1_scan_data
+```
+
+```{r}
+table2_data <- lmer_data %>%
+    filter(assessment_exact > 0) %>%
+    mutate(cohort = case_when(
+        cohort == "bidirect" ~ "BiDirect",
+        TRUE ~ "MACS+MNC"
+    )) %>%
+    select(cohort, group, chronological_age, sex)
+
+table2 <- table2_data %>% 
+    tbl_summary(
+        by = group, # Split the table by HC, MDD, CON
+        statistic = list(
+            all_continuous() ~ "{mean} ({sd}), N = {N_nonmiss}", # Show Mean (SD) and non-missing count for age
+            all_categorical() ~ "{n} ({p}%)" # Show Count (%) for Sex/Site
+        ),
+        label = list(
+            chronological_age ~ "Age (Years)",
+            sex ~ "Sex"
+        ),
+        missing = "no"
+    ) %>%
+    add_overall()
+table2 # %>% flextable::save_as_docx(path = here("output/sample_description.docx"))
+```
+
+pairwise SMD for the discovery and replication datasets, before and after matching.
+```{r}
+cat("\ndiscovery dataset\n")
+pre  <- CreateTableOne(vars = c("chronological_age","sex","tiv","scanner"), strata = "group", data = pre_matching_baseline_dataset %>% filter(cohort != "bidirect"), test = FALSE)
+post <- CreateTableOne(vars = c("chronological_age","sex","tiv","scanner"), strata = "group", data = baseline_dataset %>% filter(cohort != "bidirect"),  test = FALSE)
+ExtractSmd(pre); ExtractSmd(post)   # with >2 groups, returns the average pairwise SMD per variable
+cat("\nreplication dataset\n")
+pre  <- CreateTableOne(vars = c("chronological_age","sex","tiv","scanner"), strata = "group", data = pre_matching_baseline_dataset %>% filter(cohort == "bidirect"), test = FALSE)
+post <- CreateTableOne(vars = c("chronological_age","sex","tiv","scanner"), strata = "group", data = baseline_dataset %>% filter(cohort == "bidirect"),  test = FALSE)
+ExtractSmd(pre); ExtractSmd(post)   # with >2 groups, returns the average pairwise SMD per variable
+```
